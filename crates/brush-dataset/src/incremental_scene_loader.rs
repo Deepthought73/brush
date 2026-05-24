@@ -1,21 +1,23 @@
-use std::sync::Arc;
-
 use crate::image_cache::ImageCache;
-use crate::scene::{Scene, SceneBatch, sample_to_packed_data, view_to_sample_image};
+use crate::scene::{Scene, SceneBatch, SceneView, sample_to_packed_data, view_to_sample_image};
 use brush_async::Actor;
-use image::DynamicImage;
 use rand::{SeedableRng, seq::SliceRandom};
-use tokio::sync::{Mutex, mpsc};
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::time::sleep;
 
-pub struct SceneLoader {
+pub struct IncrementalSceneLoader {
     rx: mpsc::Receiver<SceneBatch>,
     // Owns the loader actor threads. Dropping cancels them; their
     // senders then drop, the channel closes, and `next_batch` returns.
     _actors: Vec<Actor>,
 }
 
-impl SceneLoader {
-    pub fn new(scene: &Scene, seed: u64) -> Self {
+impl IncrementalSceneLoader {
+    pub fn new(mut all_views: Vec<SceneView>, seed: u64) -> Self {
         // Prefetch buffer: at most 4 batches ahead of the trainer.
         // Two tasks per actor share this buffer so one task's I/O can
         // overlap with the other's decode + GPU upload.
@@ -31,15 +33,32 @@ impl SceneLoader {
         };
         const TASKS_PER_ACTOR: usize = 2;
 
-        let views = scene.views.clone();
-        let cache = Arc::new(Mutex::new(ImageCache::new(views.len())));
+        all_views.sort_by_key(|it| it.image.img_name());
+        let mut all_views = VecDeque::from(all_views);
+        let first_ts = all_views[0]
+            .image
+            .img_name()
+            .split('.')
+            .next()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+
+        let cache = Arc::new(Mutex::new(ImageCache::new(all_views.len())));
+        let train_views = Arc::new(RwLock::new(vec![
+            all_views.pop_front().unwrap(),
+            all_views.pop_front().unwrap(),
+            all_views.pop_front().unwrap(),
+            all_views.pop_front().unwrap(),
+            all_views.pop_front().unwrap(),
+        ]));
 
         let mut task_idx: u64 = 0;
         let actors: Vec<Actor> = (0..n_actors)
             .map(|i| {
                 let actor = Actor::new(&format!("dataloader-{i}"));
                 for _ in 0..TASKS_PER_ACTOR {
-                    let views = views.clone();
+                    let views = train_views.clone();
                     let cache = cache.clone();
                     let tx = tx.clone();
                     let task_seed = seed.wrapping_add(task_idx);
@@ -51,6 +70,38 @@ impl SceneLoader {
                 actor
             })
             .collect();
+
+        tokio::task::spawn_local(async move {
+            let train_time = Instant::now();
+            loop {
+                if all_views.is_empty() {
+                    break;
+                }
+
+                let ts = train_time.elapsed().as_nanos() as usize;
+                let mut train_views_ = train_views.write().await;
+                while let Some(first) = all_views.front() {
+                    let img_ts = first
+                        .image
+                        .img_name()
+                        .split('.')
+                        .next()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap()
+                        - first_ts;
+                    if img_ts > ts {
+                        break;
+                    }
+                    train_views_.push(all_views.pop_front().unwrap());
+                }
+                println!("Train views len: {}", train_views_.len());
+                drop(train_views_);
+                sleep(Duration::from_secs(1)).await;
+            }
+
+            println!("All images added!");
+        });
 
         Self {
             rx,
@@ -67,7 +118,7 @@ impl SceneLoader {
 }
 
 async fn run_loader(
-    views: Arc<Vec<crate::scene::SceneView>>,
+    views: Arc<RwLock<Vec<SceneView>>>,
     cache: Arc<Mutex<ImageCache>>,
     tx: mpsc::Sender<SceneBatch>,
     seed: u64,
@@ -76,12 +127,15 @@ async fn run_loader(
     let mut shuffled: Vec<usize> = Vec::new();
 
     loop {
+        let views_ = views.read().await;
         if shuffled.is_empty() {
-            shuffled = (0..views.len()).collect();
+            shuffled = (0..views_.len()).collect();
             shuffled.shuffle(&mut rng);
+            shuffled.truncate(20);
         }
         let index = shuffled.pop().expect("Need at least one view in dataset");
-        let view = &views[index];
+        let view = views_[index].clone();
+        drop(views_);
 
         let sample = if let Some(image) = cache.lock().await.get(index) {
             image
@@ -101,7 +155,7 @@ async fn run_loader(
             img_packed,
             has_alpha,
             alpha_mode: view.image.alpha_mode(),
-            camera: view.camera,
+            camera: view.camera.clone(),
         };
 
         if tx.send(batch).await.is_err() {
