@@ -6,7 +6,7 @@ use crate::{
     wait_for_device,
 };
 use anyhow::Context;
-use brush_dataset::{load_dataset, scene::Scene, scene_loader::SceneLoader};
+use brush_dataset::{load_dataset, scene::Scene};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_rerun::visualize_tools::VisualizeTools;
 use brush_train::{
@@ -27,6 +27,8 @@ use std::{path::PathBuf, sync::Arc};
 #[allow(unused)]
 use std::path::Path;
 
+use brush_dataset::incremental_scene_loader::IncrementalSceneLoader;
+use brush_dataset::scene_loader::SceneLoader;
 use tracing::{Instrument, trace_span};
 use web_time::{Duration, Instant};
 
@@ -173,7 +175,10 @@ pub(crate) async fn train_stream(
     let mut eval_scene = dataset.eval;
 
     let mut train_duration = Duration::from_secs(0);
+    //let mut dataloader =
+    //    IncrementalSceneLoader::new(dataset.train.views.iter().cloned().collect(), 42);
     let mut dataloader = SceneLoader::new(&dataset.train, 42);
+
     let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
     let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
 
