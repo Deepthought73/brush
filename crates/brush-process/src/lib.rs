@@ -3,6 +3,7 @@ pub mod config;
 pub mod message;
 pub mod slot;
 pub mod train_stream;
+pub mod incremental_train_stream;
 
 pub use brush_vfs::DataSource;
 

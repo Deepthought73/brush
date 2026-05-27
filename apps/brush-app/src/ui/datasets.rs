@@ -187,9 +187,9 @@ impl AppPane for DatasetPanel {
                     && let Some(up_axis) = up_axis
                 {
                     process.set_model_up(*up_axis);
-                    if let Some(view) = self.cur_dataset.train.views.first() {
-                        process.focus_view(&view.camera);
-                    }
+                    // if let Some(view) = self.cur_dataset.train.views.first() {
+                    //     process.focus_view(&view.camera);
+                    // }
                 }
             }
             _ => {}

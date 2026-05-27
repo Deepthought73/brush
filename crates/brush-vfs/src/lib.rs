@@ -372,6 +372,14 @@ impl BrushVfs {
         }
     }
 
+    pub fn from_entries(entries: HashMap<PathBuf, Arc<Vec<u8>>>) -> Self {
+        let path_bufs: Vec<PathBuf> = entries.keys().cloned().collect();
+        Self {
+            lookup: lookup_from_paths(&path_bufs),
+            container: VfsContainer::InMemory { entries },
+        }
+    }
+
     /// Create a test VFS from file paths with empty content.
     #[doc(hidden)]
     pub fn create_test_vfs(paths: Vec<PathBuf>) -> Self {
