@@ -8,6 +8,7 @@ use burn::tensor::Tensor;
 use egui::Rect;
 use glam::{UVec2, Vec3};
 
+use brush_render::kernels::camera_model::CameraModel;
 use eframe::egui_wgpu::{self, CallbackTrait, wgpu};
 
 #[derive(Clone)]

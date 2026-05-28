@@ -176,9 +176,9 @@ impl AppPane for DatasetPanel {
                 *self = Self::default();
             }
             ProcessMessage::TrainMessage(TrainMessage::Dataset { dataset }) => {
-                if let Some(view) = dataset.train.views.first() {
-                    process.focus_view(&view.camera);
-                }
+                // if let Some(view) = dataset.train.views.first() {
+                //     process.focus_view(&view.camera);
+                // }
                 self.cur_dataset = dataset.clone();
             }
             ProcessMessage::SplatsUpdated { up_axis, .. } => {

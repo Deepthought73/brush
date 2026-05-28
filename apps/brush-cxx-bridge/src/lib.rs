@@ -3,28 +3,23 @@ use brush_app::ui::app::App;
 use brush_process::incremental_train_stream::{
     FrameData as ProcessFrameData, NewTrainingData, create_incremental_training_process,
 };
-use brush_render::camera::{focal_to_fov, Camera};
+use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
 use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
+use glam::{Affine3A, Mat3A};
 use std::mem;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
 
 #[cxx::bridge]
 mod ffi {
+    #[namespace = "brush_cxx_bridge"]
+    #[derive(Debug)]
     enum CameraModelId {
         Pinhole,
         KannalaBrandt4,
-    }
-
-    #[namespace = "brush_cxx_bridge"]
-    #[derive(Debug)]
-    struct StampedPose {
-        t_ns: i64,
-        /// Quaternion in [w, x, y, z] order (Sophus/Eigen convention).
-        quat: [f64; 4],
-        translation: [f64; 3],
     }
 
     #[namespace = "brush_cxx_bridge"]
@@ -34,22 +29,12 @@ mod ffi {
         z: f64,
     }
 
-    /// Per-frame data sent from C++.
-    ///
-    /// `pose` is the camera-to-world transform for the primary camera.
-    /// Intrinsics (fx, fy, cx, cy) are in pixel units; width/height are the
-    /// image dimensions for this camera.
-    /// `image_data` is a packed row-major grayscale u8 buffer of size width*height.
     #[namespace = "brush_cxx_bridge"]
     struct FrameData {
-        pose: StampedPose,
+        t_ns: i64,
+        translation: [f64; 3],
+        quat: [f64; 4],
         new_landmarks: Vec<Point>,
-        fx: f64,
-        fy: f64,
-        cx: f64,
-        cy: f64,
-        width: u32,
-        height: u32,
         image_data: Vec<u8>,
     }
 
@@ -98,24 +83,18 @@ fn fd_channel_take_receiver(channel: &mut Box<FrameDataChannel>) -> Box<FrameDat
     channel.receiver.take().unwrap()
 }
 
-/// Convert an FFI `FrameData` to the process-internal representation and send it.
-///
-/// The C++ side uses [w, x, y, z] quaternion order (Sophus convention); glam
-/// `from_xyzw` expects [x, y, z, w], so the components are reordered here.
 fn send_fd(sender: &Box<FrameDataSender>, data: ffi::FrameData) {
-    let p = &data.pose;
-    // C++ layout: quat = [w, x, y, z]
     let quat = glam::Quat::from_xyzw(
-        p.quat[1] as f32,
-        p.quat[2] as f32,
-        p.quat[3] as f32,
-        p.quat[0] as f32,
+        data.quat[0] as f32,
+        data.quat[1] as f32,
+        data.quat[2] as f32,
+        data.quat[3] as f32,
     )
     .normalize();
     let translation = glam::Vec3::new(
-        p.translation[0] as f32,
-        p.translation[1] as f32,
-        p.translation[2] as f32,
+        data.translation[0] as f32,
+        data.translation[1] as f32,
+        data.translation[2] as f32,
     );
 
     let landmarks: Vec<glam::Vec3> = data
@@ -125,7 +104,7 @@ fn send_fd(sender: &Box<FrameDataSender>, data: ffi::FrameData) {
         .collect();
 
     let frame = ProcessFrameData {
-        t_ns: p.t_ns,
+        t_ns: data.t_ns,
         translation,
         quat,
         landmarks,
@@ -141,6 +120,7 @@ async fn buffer_frame_data(
     unit_camera: Camera,
     img_size: glam::UVec2,
     flush_every: Duration,
+    mask_path: PathBuf,
 ) {
     let mut buffer = vec![];
     let mut last_flush = Instant::now();
@@ -156,6 +136,7 @@ async fn buffer_frame_data(
                 mem::take(&mut buffer),
                 unit_camera,
                 img_size,
+                mask_path.clone(),
             );
             training_data_sender.send(td).unwrap();
         }
@@ -169,6 +150,8 @@ fn run_brush_ui(
     img_width: u32,
     img_height: u32,
 ) -> anyhow::Result<()> {
+    let mask_path = PathBuf::from("/datasets/monado/MI/MIO07_mapping_easy/mask.png");
+
     let camera_model = match camera_model_id {
         CameraModelId::Pinhole => CameraModel::Pinhole,
         CameraModelId::KannalaBrandt4 => CameraModel::KannalaBrandt4(KannalaBrandt4Params {
@@ -188,10 +171,7 @@ fn run_brush_ui(
         glam::Quat::IDENTITY,
         focal_to_fov(fx, img_width, &CameraModel::default()),
         focal_to_fov(fy, img_height, &CameraModel::default()),
-        glam::vec2(
-            cx as f32 / img_width as f32,
-            cy as f32 / img_height as f32,
-        ),
+        glam::vec2(cx as f32 / img_width as f32, cy as f32 / img_height as f32),
         camera_model,
     );
 
@@ -211,6 +191,7 @@ fn run_brush_ui(
         unit_camera,
         img_size,
         flush_every,
+        mask_path,
     ));
 
     let process = create_incremental_training_process(

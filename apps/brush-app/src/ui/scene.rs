@@ -1,6 +1,14 @@
+use crate::ui::frustum_widget::CameraFrustumWidget;
+use crate::ui::panels::AppPane;
+use crate::ui::settings_popup::SettingsPopup;
+use crate::ui::splat_backbuffer::SplatBackbuffer;
+use crate::ui::ui_process::{BackgroundStyle, UiProcess};
+use crate::ui::widget_3d::GridWidget;
+use crate::ui::{UiMode, draw_checkerboard};
 use brush_process::DataSource;
 use brush_process::{create_process, message::ProcessMessage};
 use brush_render::camera::{focal_to_fov, fov_to_focal};
+use brush_render::kernels::camera_model::CameraModel;
 use core::f32;
 use eframe::egui_wgpu::RenderState;
 use egui::{Align2, Button, Frame, RichText, containers::Popup};
@@ -9,13 +17,6 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use web_time::Instant;
-
-use crate::ui::panels::AppPane;
-use crate::ui::settings_popup::SettingsPopup;
-use crate::ui::splat_backbuffer::SplatBackbuffer;
-use crate::ui::ui_process::{BackgroundStyle, UiProcess};
-use crate::ui::widget_3d::GridWidget;
-use crate::ui::{UiMode, draw_checkerboard};
 
 /// Controls how often the viewport re-renders during training.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +77,8 @@ impl ErrorDisplay {
 pub struct ScenePanel {
     #[serde(skip)]
     grid: Option<GridWidget>,
+    #[serde(skip)]
+    camera_frustums: Option<CameraFrustumWidget>,
     #[serde(skip)]
     backbuffer: Option<SplatBackbuffer>,
     #[serde(skip)]
@@ -350,6 +353,9 @@ impl ScenePanel {
         self.seen_warning_count = 0;
         self.dataset = None;
         self.pose_match_alpha = 0.0;
+        if let Some(frustums) = self.camera_frustums.as_mut() {
+            frustums.clear();
+        }
     }
 
     /// Fade in letterbox/pillarbox bars while the user is sitting on a dataset
@@ -557,6 +563,34 @@ impl ScenePanel {
         let mut enabled = settings.grid_enabled.unwrap_or(false);
         if ui.checkbox(&mut enabled, "Show Grid").changed() {
             settings.grid_enabled = Some(enabled);
+            process.set_cam_settings(&settings);
+        }
+
+        if ui
+            .checkbox(&mut settings.use_distortion_model, "Use Distortion Model")
+            .changed()
+        {
+            process.set_cam_settings(&settings);
+        }
+
+        if ui
+            .checkbox(&mut settings.show_frustums, "Show Camera Frustums")
+            .changed()
+        {
+            process.set_cam_settings(&settings);
+        }
+
+        ui.label(RichText::new("Frustum Scale").size(12.0));
+        let mut frustum_scale = settings.frustum_scale.unwrap_or(0.15);
+
+        let response = ui.add(
+            Slider::new(&mut frustum_scale, 0.01..=0.2)
+                .show_value(true)
+                .custom_formatter(|val, _| format!("{val:.2}x")),
+        );
+
+        if response.changed() {
+            settings.frustum_scale = Some(frustum_scale);
             process.set_cam_settings(&settings);
         }
 
@@ -807,6 +841,7 @@ impl AppPane for ScenePanel {
 
     fn init(&mut self, state: &RenderState, process: &UiProcess) {
         self.grid = Some(GridWidget::new(state));
+        self.camera_frustums = Some(CameraFrustumWidget::new(state));
         self.backbuffer = Some(SplatBackbuffer::new(state, process.actor()));
         // Create the settings popup now that we have the base_path
         self.settings_popup = Some(Arc::new(Mutex::new(SettingsPopup::new())));
@@ -894,6 +929,9 @@ impl AppPane for ScenePanel {
                 dataset,
             }) => {
                 self.dataset = Some(dataset.clone());
+                if let Some(frustums) = self.camera_frustums.as_mut() {
+                    frustums.set_dataset(dataset);
+                }
             }
             _ => {}
         }
@@ -1059,6 +1097,10 @@ impl AppPane for ScenePanel {
                 }
 
                 if let Some(backbuffer) = &mut self.backbuffer {
+                    let mut camera = camera.clone();
+                    if !settings.use_distortion_model {
+                        camera.camera_model = CameraModel::Pinhole;
+                    }
                     backbuffer.paint(
                         rect,
                         ui,
@@ -1076,6 +1118,12 @@ impl AppPane for ScenePanel {
                     let model_ltw = process.model_local_to_world();
                     let grid_opacity = process.get_grid_opacity();
                     grid.paint(rect, camera, model_ltw, grid_opacity, ui);
+                }
+
+                if settings.show_frustums {
+                    if let Some(frustums) = &self.camera_frustums {
+                        frustums.paint(rect, camera, ui, settings.frustum_scale.unwrap_or(0.15));
+                    }
                 }
             });
 

@@ -150,6 +150,9 @@ pub struct CameraSettings {
     pub background: Option<Vec3>,
     pub grid_enabled: Option<bool>,
     pub clamping: CameraClamping,
+    pub use_distortion_model: bool,
+    pub show_frustums: bool,
+    pub frustum_scale: Option<f32>,
 }
 
 const TREE_STORAGE_KEY: &str = "brush_tile_tree_v3";

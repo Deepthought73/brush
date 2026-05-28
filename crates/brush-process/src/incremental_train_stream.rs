@@ -24,10 +24,12 @@ use brush_train::{
 };
 use brush_vfs::BrushVfs;
 use burn::{module::AutodiffModule, tensor::Tensor};
-use image::DynamicImage;
+use image::{DynamicImage, ImageFormat};
 use rand::{SeedableRng, seq::IndexedRandom};
+use std::fs::File;
 use std::{
     collections::{HashMap, VecDeque},
+    fs,
     path::PathBuf,
     sync::Arc,
 };
@@ -115,8 +117,21 @@ pub async fn incremental_train_stream(
     let mut train_duration = Duration::from_secs(0);
     let mut slot_initialized = false;
 
+    let mut up_axis = None;
+
     loop {
         while let Ok(new_data) = training_data_receiver.try_recv() {
+            log::info!(
+                "Adding new training data: {} landmarks, {} poses",
+                new_data.new_landmarks.len(),
+                new_data.training_views.len()
+            );
+
+            if up_axis.is_none() {
+                let rot = glam::Mat3::from_quat(new_data.training_views[0].camera.rotation);
+                up_axis = Some(rot.y_axis)
+            }
+
             add_new_landmarks(
                 new_data.new_landmarks,
                 &mut splats,
@@ -152,7 +167,7 @@ pub async fn incremental_train_stream(
                 }
                 emitter
                     .emit(ProcessMessage::SplatsUpdated {
-                        up_axis: None,
+                        up_axis,
                         frame: 0,
                         total_frames: 1,
                         num_splats: s.num_splats(),
@@ -168,6 +183,7 @@ pub async fn incremental_train_stream(
             continue;
         }
 
+        /*
         // Run one training step.
         {
             let step_start = Instant::now();
@@ -175,7 +191,7 @@ pub async fn incremental_train_stream(
             // TODO try importance sampling depending on how often an image was trained on
             let batch = {
                 let view = views.choose(&mut rng).expect("views non-empty");
-                let alpha_mode = AlphaMode::Transparent;
+                let alpha_mode = AlphaMode::Masked;
                 let img = view_to_sample_image(view.image.as_ref().clone(), alpha_mode);
                 let (img_packed, has_alpha) = sample_to_packed_data(img);
                 SceneBatch {
@@ -234,6 +250,7 @@ pub async fn incremental_train_stream(
                     .await;
             }
         }
+        */
 
         brush_async::yield_now().await;
     }
@@ -277,6 +294,7 @@ impl NewTrainingData {
         fds: Vec<FrameData>,
         unit_camera: Camera,
         img_size: glam::UVec2,
+        mask_path: PathBuf,
     ) -> Self {
         let mut training_views = vec![];
         let mut scene_views = vec![];
@@ -288,21 +306,29 @@ impl NewTrainingData {
             let img = DynamicImage::ImageLuma8(gray);
 
             let mut png_bytes: Vec<u8> = Vec::new();
-            img.write_to(
-                &mut std::io::Cursor::new(&mut png_bytes),
-                image::ImageFormat::Png,
-            )
-            .unwrap();
+            img.write_to(&mut std::io::Cursor::new(&mut png_bytes), ImageFormat::Png)
+                .unwrap();
+
+            let mask_img = image::open(&mask_path).unwrap();
+            let mut mask_png_bytes: Vec<u8> = Vec::new();
+            mask_img
+                .write_to(
+                    &mut std::io::Cursor::new(&mut mask_png_bytes),
+                    ImageFormat::Png,
+                )
+                .unwrap();
 
             let img_path = PathBuf::from(&format!("{}.png", frame.t_ns));
-            let vfs =
-                BrushVfs::from_entries(HashMap::from([(img_path.clone(), Arc::new(png_bytes))]));
+            let vfs = BrushVfs::from_entries(HashMap::from([
+                (img_path.clone(), Arc::new(png_bytes)),
+                (mask_path.clone(), Arc::new(mask_png_bytes)),
+            ]));
             let load_image = brush_dataset::scene::LoadImage::new(
                 Arc::new(vfs),
                 img_path,
-                None, // TODO use mask
+                Some(mask_path.clone()),
                 u32::MAX,
-                Some(AlphaMode::Transparent),
+                Some(AlphaMode::Masked),
             );
 
             let mut camera = unit_camera.clone();

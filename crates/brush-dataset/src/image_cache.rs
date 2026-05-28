@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use image::DynamicImage;
+use std::sync::Arc;
 
 /// Cache budget for decoded source images. 6 GB on native; less on
 /// wasm since the whole heap is bounded by browser limits.
@@ -26,7 +26,7 @@ impl ImageCache {
         }
     }
 
-    pub  fn get(&self, index: usize) -> Option<Arc<DynamicImage>> {
+    pub fn get(&self, index: usize) -> Option<Arc<DynamicImage>> {
         self.slots[index].clone()
     }
 
