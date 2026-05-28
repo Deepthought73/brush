@@ -24,7 +24,7 @@ use brush_train::{
 };
 use brush_vfs::BrushVfs;
 use burn::{module::AutodiffModule, tensor::Tensor};
-use image::{DynamicImage, ImageFormat};
+use image::{DynamicImage, GenericImageView, ImageFormat};
 use rand::{SeedableRng, seq::IndexedRandom};
 use std::fs::File;
 use std::{
@@ -183,7 +183,6 @@ pub async fn incremental_train_stream(
             continue;
         }
 
-        /*
         // Run one training step.
         {
             let step_start = Instant::now();
@@ -216,8 +215,11 @@ pub async fn incremental_train_stream(
             let refine_every = train_stream_config.train_config.refine_every;
             if iter > 0 && iter % refine_every == 0 {
                 let current = splats.take().unwrap();
+                let before_num = current.num_splats();
                 let (new_splats, refine_stats) =
                     trainer.as_mut().unwrap().refine(iter, current).await;
+                let after_num = new_splats.num_splats();
+                log::info!("Refinement: {} -> {}", before_num, after_num);
                 slot.set(0, new_splats.clone());
                 emitter
                     .emit(ProcessMessage::TrainMessage(TrainMessage::RefineStep {
@@ -250,7 +252,6 @@ pub async fn incremental_train_stream(
                     .await;
             }
         }
-        */
 
         brush_async::yield_now().await;
     }
@@ -300,28 +301,50 @@ impl NewTrainingData {
         let mut scene_views = vec![];
         let mut new_landmarks = vec![];
 
+        // TODO load mask only once
+        let mask_disk = image::open(&mask_path).expect("failed to open mask image");
+        if mask_disk.width() != img_size.x || mask_disk.height() != img_size.y {
+            panic!("mask image dimensions do not match");
+        }
+        let mask_luma = mask_disk.to_luma8();
+
+        let mut mask_png_bytes: Vec<u8> = Vec::new();
+        DynamicImage::ImageLuma8(mask_luma.clone())
+            .write_to(
+                &mut std::io::Cursor::new(&mut mask_png_bytes),
+                ImageFormat::Png,
+            )
+            .unwrap();
+        let mask_png_arc = Arc::new(mask_png_bytes);
+        let mask_raw: Vec<u8> = mask_luma.into_raw();
+
         for frame in fds {
             let gray =
                 image::GrayImage::from_raw(img_size.x, img_size.y, frame.image_data).unwrap();
-            let img = DynamicImage::ImageLuma8(gray);
 
+            // Trainer input: RGBA where RGB replicates the grayscale value and
+            // A holds the mask, so the AlphaMode::Masked path actually zeros
+            // out the loss outside the fisheye circle.
+            let pixel_count = (img_size.x * img_size.y) as usize;
+            let mut rgba_bytes = Vec::with_capacity(pixel_count * 4);
+            for (g, m) in gray.as_raw().iter().zip(mask_raw.iter()) {
+                rgba_bytes.extend_from_slice(&[*g, *g, *g, *m]);
+            }
+            let train_rgba = image::RgbaImage::from_raw(img_size.x, img_size.y, rgba_bytes)
+                .expect("rgba buffer size mismatch");
+            let train_img = DynamicImage::ImageRgba8(train_rgba);
+
+            // scene_views path keeps a separate grayscale PNG + shared mask PNG
+            // in the VFS; LoadImage will fold the mask into alpha on demand.
             let mut png_bytes: Vec<u8> = Vec::new();
-            img.write_to(&mut std::io::Cursor::new(&mut png_bytes), ImageFormat::Png)
-                .unwrap();
-
-            let mask_img = image::open(&mask_path).unwrap();
-            let mut mask_png_bytes: Vec<u8> = Vec::new();
-            mask_img
-                .write_to(
-                    &mut std::io::Cursor::new(&mut mask_png_bytes),
-                    ImageFormat::Png,
-                )
+            DynamicImage::ImageLuma8(gray)
+                .write_to(&mut std::io::Cursor::new(&mut png_bytes), ImageFormat::Png)
                 .unwrap();
 
             let img_path = PathBuf::from(&format!("{}.png", frame.t_ns));
             let vfs = BrushVfs::from_entries(HashMap::from([
                 (img_path.clone(), Arc::new(png_bytes)),
-                (mask_path.clone(), Arc::new(mask_png_bytes)),
+                (mask_path.clone(), mask_png_arc.clone()),
             ]));
             let load_image = brush_dataset::scene::LoadImage::new(
                 Arc::new(vfs),
@@ -337,7 +360,7 @@ impl NewTrainingData {
 
             training_views.push(TrainingView {
                 camera,
-                image: Arc::new(img),
+                image: Arc::new(train_img),
             });
             scene_views.push(SceneView {
                 image: load_image,

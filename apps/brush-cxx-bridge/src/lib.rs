@@ -1,5 +1,6 @@
 use crate::ffi::CameraModelId;
 use brush_app::ui::app::App;
+use brush_process::config::TrainStreamConfig;
 use brush_process::incremental_train_stream::{
     FrameData as ProcessFrameData, NewTrainingData, create_incremental_training_process,
 };
@@ -150,7 +151,11 @@ fn run_brush_ui(
     img_width: u32,
     img_height: u32,
 ) -> anyhow::Result<()> {
-    let mask_path = PathBuf::from("/datasets/monado/MI/MIO07_mapping_easy/mask.png");
+    //let mask_path = PathBuf::from("/datasets/monado/MI/MIO07_mapping_easy/mask.png");
+    let mask_path = PathBuf::from("/datasets/custom/mask.png");
+    let mut config = TrainStreamConfig::default();
+    //config.train_config.max_splats = 100000;
+    config.train_config.refine_every = 500;
 
     let camera_model = match camera_model_id {
         CameraModelId::Pinhole => CameraModel::Pinhole,
@@ -169,8 +174,8 @@ fn run_brush_ui(
     let unit_camera = Camera::new(
         glam::Vec3::ZERO,
         glam::Quat::IDENTITY,
-        focal_to_fov(fx, img_width, &CameraModel::default()),
-        focal_to_fov(fy, img_height, &CameraModel::default()),
+        focal_to_fov(fx, img_width, &camera_model),
+        focal_to_fov(fy, img_height, &camera_model),
         glam::vec2(cx as f32 / img_width as f32, cy as f32 / img_height as f32),
         camera_model,
     );
@@ -194,10 +199,7 @@ fn run_brush_ui(
         mask_path,
     ));
 
-    let process = create_incremental_training_process(
-        training_data_receiver,
-        brush_process::config::TrainStreamConfig::default(),
-    );
+    let process = create_incremental_training_process(training_data_receiver, config);
 
     runtime.block_on(async move {
         let logger = env_logger::Builder::from_default_env()

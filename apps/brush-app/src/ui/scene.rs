@@ -1053,15 +1053,18 @@ impl AppPane for ScenePanel {
                 process.tick_controls(&response, ui);
             }
 
+            let settings = process.get_cam_settings();
+
             // Get camera after modifying the controls.
             let mut camera = process.current_camera();
+            if !settings.use_distortion_model {
+                camera.camera_model = CameraModel::Pinhole;
+            }
 
             let view_eff = (camera.world_to_local() * process.model_local_to_world()).inverse();
             let (_, rotation, position) = view_eff.to_scale_rotation_translation();
             camera.position = position;
             camera.rotation = rotation;
-
-            let settings = process.get_cam_settings();
 
             // Adjust FOV so that the scene view shows at least what's visible in the dataset view.
             // fov_to_focal(fov, 2, model) = 1 / projection(half_fov), so the ratio gives projected_x / projected_y.
@@ -1097,10 +1100,6 @@ impl AppPane for ScenePanel {
                 }
 
                 if let Some(backbuffer) = &mut self.backbuffer {
-                    let mut camera = camera.clone();
-                    if !settings.use_distortion_model {
-                        camera.camera_model = CameraModel::Pinhole;
-                    }
                     backbuffer.paint(
                         rect,
                         ui,

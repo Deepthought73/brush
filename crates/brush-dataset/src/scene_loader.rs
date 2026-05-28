@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::image_cache::ImageCache;
 use crate::scene::{Scene, SceneBatch, sample_to_packed_data, view_to_sample_image};
 use brush_async::Actor;
-use image::DynamicImage;
 use rand::{SeedableRng, seq::SliceRandom};
 use tokio::sync::{Mutex, mpsc};
 
