@@ -20,7 +20,7 @@ use brush_train::{
 use brush_vfs::BrushVfs;
 use burn::module::AutodiffModule;
 use burn_cubecl::cubecl::Runtime;
-use burn_wgpu::WgpuRuntime;
+use burn_wgpu::{AutoCompiler, WgpuRuntime};
 use rand::SeedableRng;
 use std::{path::PathBuf, sync::Arc};
 
@@ -167,7 +167,7 @@ pub(crate) async fn train_stream(
     emitter.emit(ProcessMessage::DoneLoading).await;
 
     // Start with memory cleared out.
-    let client = WgpuRuntime::client(wgpu_device);
+    let client = WgpuRuntime::<AutoCompiler>::client(wgpu_device);
     client.memory_cleanup();
 
     let mut eval_scene = dataset.eval;
@@ -256,7 +256,7 @@ pub(crate) async fn train_stream(
             let after = splats.num_splats();
             log::info!("LOD {current_lod}/{lod_levels}: {before} -> {after} splats");
 
-            let client = WgpuRuntime::client(wgpu_device);
+            let client = WgpuRuntime::<AutoCompiler>::client(wgpu_device);
             client.memory_cleanup();
 
             let cumulative_scale = (lod_img_pct as f32 / 100.0).powi(current_lod as i32);
@@ -350,6 +350,7 @@ pub(crate) async fn train_stream(
                 iter,
                 eval_scene,
                 save_path,
+                train_stream_config.rerun_config.rerun_max_img_size,
             )
             .await
             .with_context(|| format!("Failed evaluation at iteration {iter}"));
@@ -407,7 +408,10 @@ pub(crate) async fn train_stream(
                     .unwrap();
             }
 
-            visualize.log_memory(iter, &WgpuRuntime::client(wgpu_device).memory_usage()?)?;
+            visualize.log_memory(
+                iter,
+                &WgpuRuntime::<AutoCompiler>::client(wgpu_device).memory_usage_total()?,
+            )?;
             if refine.num_added > 0 {
                 visualize
                     .log_refine_stats(iter, &refine, refine_dur)
@@ -469,7 +473,12 @@ async fn run_eval(
     iter: u32,
     eval_scene: &Scene,
     save_path: Option<PathBuf>,
+    rerun_max_img_size: u32,
 ) -> Result<(), anyhow::Error> {
+    if eval_scene.views.is_empty() {
+        return Ok(());
+    }
+
     let mut psnr = 0.0;
     let mut ssim = 0.0;
     let mut count = 0;
@@ -505,7 +514,9 @@ async fn run_eval(
         #[cfg(target_family = "wasm")]
         let _ = save_path;
 
-        visualize.log_eval_sample(iter, i as u32, sample).await?;
+        visualize
+            .log_eval_sample(iter, i as u32, sample, rerun_max_img_size)
+            .await?;
     }
     psnr /= count as f32;
     ssim /= count as f32;

@@ -1,5 +1,4 @@
-use brush_cube::calc_cube_count_1d;
-use brush_render::MainBackendBase;
+use brush_cube::{MainBackendBase, calc_cube_count_1d};
 use brush_render::gaussian_splats::SplatRenderMode;
 use brush_render::kernels::types::RasterizeUniformsLaunch;
 use brush_render::sh::sh_coeffs_for_degree;
@@ -20,7 +19,6 @@ use crate::kernels;
 use brush_render::shaders::helpers::ProjectUniforms;
 
 impl SplatBwdOps<Self> for MainBackendBase {
-    #[allow(clippy::too_many_arguments)]
     fn rasterize_bwd(
         out_img: FloatTensor<Self>,
         projected_splats: FloatTensor<Self>,
@@ -70,37 +68,34 @@ impl SplatBwdOps<Self> for MainBackendBase {
             use kernels::rasterize_backwards::{
                 CasAtomicAdd, HfAtomicAdd, rasterize_backwards_kernel,
             };
-            // SAFETY: Kernel checked to have no OOB, bounded loops.
-            unsafe {
-                if hard_floats {
-                    rasterize_backwards_kernel::launch_unchecked::<HfAtomicAdd, WgpuRuntime>(
-                        &client,
-                        cube_count,
-                        cube_dim,
-                        compact_gid_from_isect.into_tensor_arg(),
-                        tile_offsets.into_tensor_arg(),
-                        projected_splats.into_tensor_arg(),
-                        out_img.into_tensor_arg(),
-                        v_output.into_tensor_arg(),
-                        v_combined.clone().into_tensor_arg(),
-                        uniforms,
-                        smooth_cutoff,
-                    );
-                } else {
-                    rasterize_backwards_kernel::launch_unchecked::<CasAtomicAdd, WgpuRuntime>(
-                        &client,
-                        cube_count,
-                        cube_dim,
-                        compact_gid_from_isect.into_tensor_arg(),
-                        tile_offsets.into_tensor_arg(),
-                        projected_splats.into_tensor_arg(),
-                        out_img.into_tensor_arg(),
-                        v_output.into_tensor_arg(),
-                        v_combined.clone().into_tensor_arg(),
-                        uniforms,
-                        smooth_cutoff,
-                    );
-                }
+            if hard_floats {
+                rasterize_backwards_kernel::launch::<HfAtomicAdd, WgpuRuntime>(
+                    &client,
+                    cube_count,
+                    cube_dim,
+                    compact_gid_from_isect.into_tensor_arg(),
+                    tile_offsets.into_tensor_arg(),
+                    projected_splats.into_tensor_arg(),
+                    out_img.into_tensor_arg(),
+                    v_output.into_tensor_arg(),
+                    v_combined.clone().into_tensor_arg(),
+                    uniforms,
+                    smooth_cutoff,
+                );
+            } else {
+                rasterize_backwards_kernel::launch::<CasAtomicAdd, WgpuRuntime>(
+                    &client,
+                    cube_count,
+                    cube_dim,
+                    compact_gid_from_isect.into_tensor_arg(),
+                    tile_offsets.into_tensor_arg(),
+                    projected_splats.into_tensor_arg(),
+                    out_img.into_tensor_arg(),
+                    v_output.into_tensor_arg(),
+                    v_combined.clone().into_tensor_arg(),
+                    uniforms,
+                    smooth_cutoff,
+                );
             }
         });
 
@@ -149,29 +144,24 @@ impl SplatBwdOps<Self> for MainBackendBase {
         let uniforms = project_uniforms.to_launch_object();
 
         tracing::trace_span!("ProjectBackwards").in_scope(|| {
-            // SAFETY: Kernel has to contain no OOB indexing, bounded loops.
-            unsafe {
-                kernels::project_backwards::project_backwards_kernel::launch_unchecked::<
-                    WgpuRuntime,
-                >(
-                    &client,
-                    calc_cube_count_1d(num_visible, kernels::project_backwards::WG_SIZE),
-                    CubeDim::new_1d(kernels::project_backwards::WG_SIZE),
-                    transforms.into_tensor_arg(),
-                    sh_coeffs.into_tensor_arg(),
-                    raw_opac.into_tensor_arg(),
-                    global_from_compact_gid.into_tensor_arg(),
-                    v_combined.into_tensor_arg(),
-                    v_transforms.clone().into_tensor_arg(),
-                    v_coeffs.clone().into_tensor_arg(),
-                    v_raw_opac.clone().into_tensor_arg(),
-                    v_refine_weight.clone().into_tensor_arg(),
-                    uniforms,
-                    mip_splat,
-                    project_uniforms.sh_degree,
-                    project_uniforms.camera_model,
-                );
-            }
+            kernels::project_backwards::project_backwards_kernel::launch::<WgpuRuntime>(
+                &client,
+                calc_cube_count_1d(num_visible, kernels::project_backwards::WG_SIZE),
+                CubeDim::new_1d(kernels::project_backwards::WG_SIZE),
+                transforms.into_tensor_arg(),
+                sh_coeffs.into_tensor_arg(),
+                raw_opac.into_tensor_arg(),
+                global_from_compact_gid.into_tensor_arg(),
+                v_combined.into_tensor_arg(),
+                v_transforms.clone().into_tensor_arg(),
+                v_coeffs.clone().into_tensor_arg(),
+                v_raw_opac.clone().into_tensor_arg(),
+                v_refine_weight.clone().into_tensor_arg(),
+                uniforms,
+                mip_splat,
+                project_uniforms.sh_degree,
+                project_uniforms.camera_model,
+            );
         });
 
         SplatGrads {

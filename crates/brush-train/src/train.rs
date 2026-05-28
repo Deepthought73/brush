@@ -14,7 +14,7 @@ use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::render_splats;
 use burn::{
-    backend::wgpu::{WgpuDevice, WgpuRuntime},
+    backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
     lr_scheduler::{
         LrScheduler,
         exponential::{ExponentialLrScheduler, ExponentialLrSchedulerConfig},
@@ -78,8 +78,17 @@ impl SplatTrainer {
 
         let ssim_enabled = config.ssim_weight > 0.0;
 
+        // Growth is gated on the global iter. LOD phases run past
+        // total_train_iters but their refines should never grow — clamp
+        // here so growth_stop is never effectively past end-of-training.
+        let mut config = config.clone();
+        config.growth_stop_iter = config.growth_stop_iter.min(config.total_train_iters);
+
+        #[cfg(not(target_family = "wasm"))]
+        let lpips = (config.lpips_loss_weight > 0.0).then(|| lpips::load_vgg_lpips(device));
+
         Self {
-            config: config.clone(),
+            config,
             sched_mean: lr_mean.init().expect("Mean lr schedule must be valid."),
             optim: None,
             refine_record: None,
@@ -88,7 +97,7 @@ impl SplatTrainer {
             step_count: 0,
             max_sh_degree: 0,
             #[cfg(not(target_family = "wasm"))]
-            lpips: (config.lpips_loss_weight > 0.0).then(|| lpips::load_vgg_lpips(device)),
+            lpips,
         }
     }
 
@@ -339,7 +348,7 @@ impl SplatTrainer {
     pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
         let device = splats.device();
         // `memory_cleanup` lives on the wgpu client, not on `Device`.
-        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let client = WgpuRuntime::<AutoCompiler>::client(&WgpuDevice::default());
 
         let refiner = self
             .refine_record
@@ -591,7 +600,7 @@ impl SplatTrainer {
             // Optimizer state lives on the inner (non-autodiff) device.
             let opt_device = device.clone().inner();
             let refine_inds_opt = refine_inds.to_device(&opt_device);
-            // Both halves of a split start with zero Adam state; only the
+            // Both halves of a split start with zero Adam moments; only the
             // ±sample position offset tells them apart. Burn's scatter bridge
             // only implements Add, so we add the negated parent value to zero
             // it out instead of using Assign.
@@ -631,16 +640,6 @@ impl SplatTrainer {
                     );
                     Tensor::cat(vec![x, Tensor::zeros([refine_count], &opt_device)], 0)
                 },
-                |t: Tensor<1, Int>| {
-                    let neg_parent = -t.clone().select(0, refine_inds_opt.clone());
-                    let t = t.scatter(
-                        0,
-                        refine_inds_opt.clone(),
-                        neg_parent,
-                        IndexingUpdateOp::Add,
-                    );
-                    Tensor::cat(vec![t, Tensor::zeros([refine_count], &opt_device)], 0)
-                },
             );
         }
 
@@ -668,43 +667,23 @@ fn map_splats_and_opt(
     map_opt_transforms: impl Fn(Tensor<2>) -> Tensor<2>,
     map_opt_sh_coeffs: impl Fn(Tensor<3>) -> Tensor<3>,
     map_opt_opac: impl Fn(Tensor<1>) -> Tensor<1>,
-    // Applied to per-splat time tensors in each AdamState (when present).
-    // Same transform for all three params since their time tensors are
-    // always rank-1 over splat count.
-    map_opt_time: impl Fn(Tensor<1, Int>) -> Tensor<1, Int>,
 ) -> Splats {
     splats.transforms = splats.transforms.map(map_transforms);
-    map_opt(
-        splats.transforms.id,
-        record,
-        &map_opt_transforms,
-        &map_opt_time,
-    );
+    map_opt(splats.transforms.id, record, &map_opt_transforms);
     splats.sh_coeffs = splats.sh_coeffs.map(map_sh_coeffs);
-    map_opt(
-        splats.sh_coeffs.id,
-        record,
-        &map_opt_sh_coeffs,
-        &map_opt_time,
-    );
+    map_opt(splats.sh_coeffs.id, record, &map_opt_sh_coeffs);
     splats.raw_opacities = splats.raw_opacities.map(map_opac);
-    map_opt(
-        splats.raw_opacities.id,
-        record,
-        &map_opt_opac,
-        &map_opt_time,
-    );
+    map_opt(splats.raw_opacities.id, record, &map_opt_opac);
     splats
 }
 
-/// Apply `map_fn` to `moment_1` and `moment_2`, and `map_time_fn` to the
-/// per-splat `time`. `map_fn` must be shape-agnostic along trailing dims
-/// since `moment_2` may have size-1 trailing dims under `reduce_moment_2`.
+/// Apply `map_fn` to `moment_1` and `moment_2`. `map_fn` must be shape-agnostic
+/// along trailing dims since `moment_2` may have size-1 trailing dims under
+/// `reduce_moment_2`.
 fn map_opt<const D: usize>(
     param_id: ParamId,
     record: &mut HashMap<ParamId, AdaptorRecord<AdamScaled>>,
     map_fn: &impl Fn(Tensor<D>) -> Tensor<D>,
-    map_time_fn: &impl Fn(Tensor<1, Int>) -> Tensor<1, Int>,
 ) {
     let mut state: AdamState<D> = record
         .remove(&param_id)
@@ -714,7 +693,6 @@ fn map_opt<const D: usize>(
     state.momentum = state.momentum.map(|mut moment| {
         moment.moment_1 = map_fn(moment.moment_1);
         moment.moment_2 = map_fn(moment.moment_2);
-        moment.time = map_time_fn(moment.time);
         moment
     });
 
@@ -757,9 +735,6 @@ async fn prune_points(
         // refiner runs on the inner device — give `keep()` an inner copy.
         use brush_render::burn_glue::detach_autodiff_int;
         let inner_valid_inds = detach_autodiff_int(valid_inds.clone().inner());
-        // time_per_splat lives on the optimizer's inner device, so we use the
-        // pre-detached inner indices we already have for the refiner.
-        let inner_inds_time = inner_valid_inds.clone();
         splats = map_splats_and_opt(
             splats,
             record,
@@ -769,7 +744,6 @@ async fn prune_points(
             |x| x.select(0, valid_inds.clone()),
             |x| x.select(0, valid_inds.clone()),
             |x| x.select(0, valid_inds.clone()),
-            |t| t.select(0, inner_inds_time.clone()),
         );
         refiner = refiner.keep(inner_valid_inds);
     }

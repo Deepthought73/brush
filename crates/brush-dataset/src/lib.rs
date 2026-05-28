@@ -2,11 +2,11 @@
 
 pub mod config;
 pub mod incremental_scene_loader;
+pub mod load_image;
 pub mod scene;
 pub mod scene_loader;
 
 mod formats;
-mod image_cache;
 
 pub use formats::{DatasetLoadResult, load_dataset};
 
