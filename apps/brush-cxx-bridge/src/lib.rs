@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::mem;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
 
 #[cxx::bridge]
@@ -24,23 +24,16 @@ mod ffi {
     }
 
     #[namespace = "brush_cxx_bridge"]
-    struct Point {
-        x: f64,
-        y: f64,
-        z: f64,
-    }
-
-    #[namespace = "brush_cxx_bridge"]
     struct StampedPose {
         frame_id: i64,
-        translation: [f64; 3],
-        quat: [f64; 4],
+        translation: [f32; 3],
+        quat: [f32; 4],
     }
 
     #[namespace = "brush_cxx_bridge"]
     struct FrameData {
         new_poses: Vec<StampedPose>,
-        new_landmarks: Vec<Point>,
+        new_landmarks_packed: Vec<f32>,
         image_frame_id: i64,
         image_data: Vec<u8>,
     }
@@ -71,11 +64,11 @@ struct FrameDataChannel {
     receiver: Option<Box<FrameDataReceiver>>,
 }
 
-struct FrameDataSender(tokio::sync::mpsc::UnboundedSender<ProcessFrameData>);
-struct FrameDataReceiver(tokio::sync::mpsc::UnboundedReceiver<ProcessFrameData>);
+struct FrameDataSender(UnboundedSender<ProcessFrameData>);
+struct FrameDataReceiver(UnboundedReceiver<ProcessFrameData>);
 
 fn create_frame_data_channel() -> Box<FrameDataChannel> {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<ProcessFrameData>();
+    let (sender, receiver) = unbounded_channel::<ProcessFrameData>();
     FrameDataChannel {
         sender: Some(FrameDataSender(sender).into()),
         receiver: Some(FrameDataReceiver(receiver).into()),
@@ -96,31 +89,21 @@ fn send_fd(sender: &Box<FrameDataSender>, data: ffi::FrameData) {
         .new_poses
         .into_iter()
         .map(|pose| {
-            let quat = glam::Quat::from_xyzw(
-                pose.quat[0] as f32,
-                pose.quat[1] as f32,
-                pose.quat[2] as f32,
-                pose.quat[3] as f32,
-            )
-            .normalize();
+            let quat =
+                glam::Quat::from_xyzw(pose.quat[0], pose.quat[1], pose.quat[2], pose.quat[3])
+                    .normalize();
             let translation = glam::Vec3::new(
-                pose.translation[0] as f32,
-                pose.translation[1] as f32,
-                pose.translation[2] as f32,
+                pose.translation[0],
+                pose.translation[1],
+                pose.translation[2],
             );
             (pose.frame_id, translation, quat)
         })
         .collect();
 
-    let landmarks: Vec<glam::Vec3> = data
-        .new_landmarks
-        .iter()
-        .map(|pt| glam::Vec3::new(pt.x as f32, pt.y as f32, pt.z as f32))
-        .collect();
-
     let frame = ProcessFrameData {
         poses,
-        landmarks,
+        landmarks_packed: data.new_landmarks_packed,
         image_frame_id: data.image_frame_id,
         image_data: data.image_data,
     };
@@ -136,7 +119,7 @@ async fn buffer_frame_data(
     flush_every: Duration,
     mask_path: PathBuf,
 ) {
-    let mut landmarks = vec![];
+    let mut landmarks_packed = vec![];
     let mut poses = vec![];
     let mut images = HashMap::new();
     let mut last_flush = Instant::now();
@@ -144,7 +127,7 @@ async fn buffer_frame_data(
 
     loop {
         let fd = fd_receiver.recv().await.unwrap();
-        landmarks.extend(fd.landmarks);
+        landmarks_packed.extend(fd.landmarks_packed);
         poses.extend(fd.poses);
         images.insert(fd.image_frame_id, fd.image_data);
 
@@ -158,12 +141,11 @@ async fn buffer_frame_data(
                     poses_without_image += 1;
                 }
             }
-            println!("left over poses without image: {}", poses_without_image);
 
             last_flush = Instant::now();
             let td = NewTrainingData::build_from_frame_data(
                 poses_with_image,
-                mem::take(&mut landmarks),
+                mem::take(&mut landmarks_packed),
                 unit_camera,
                 img_size,
                 mask_path.clone(),
@@ -183,8 +165,9 @@ fn run_brush_ui(
 ) -> anyhow::Result<()> {
     let mask_path = PathBuf::from(mask_path);
     let mut config = TrainStreamConfig::default();
-    //config.train_config.max_splats = 100000;
+    config.train_config.max_splats = 200000;
     config.train_config.refine_every = 500;
+    config.process_config.eval_every = 100;
 
     let camera_model = match camera_model_id {
         CameraModelId::Pinhole => CameraModel::Pinhole,
@@ -225,10 +208,10 @@ fn run_brush_ui(
         unit_camera,
         img_size,
         flush_every,
-        mask_path,
+        mask_path.clone(),
     ));
 
-    let process = create_incremental_training_process(training_data_receiver, config);
+    let process = create_incremental_training_process(training_data_receiver, config, mask_path);
 
     runtime.block_on(async move {
         let logger = env_logger::Builder::from_default_env()

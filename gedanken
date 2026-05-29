@@ -1,0 +1,14 @@
+
+- loop closure
+
+- which points to send to brush
+
+- training convergence:
+    - better densification:
+        - 
+
+- when to train what?
+    - importance sampling of images dependent on number of training steps using this image
+    - only use n last images for training -> requires marginalized region to be reasonably reconstructed
+
+- isotropic regularization loss to stabilize boundary gaussians
