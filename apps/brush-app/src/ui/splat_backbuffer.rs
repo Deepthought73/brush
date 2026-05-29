@@ -5,11 +5,9 @@ use brush_render::{
     render_splats,
 };
 use burn::tensor::Tensor;
+use eframe::egui_wgpu::{self, CallbackTrait, wgpu};
 use egui::Rect;
 use glam::{UVec2, Vec3};
-
-use brush_render::kernels::camera_model::CameraModel;
-use eframe::egui_wgpu::{self, CallbackTrait, wgpu};
 
 #[derive(Clone)]
 struct RenderRequest {

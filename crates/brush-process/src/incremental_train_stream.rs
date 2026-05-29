@@ -10,12 +10,10 @@ use brush_dataset::{
     Dataset,
     scene::{SceneBatch, SceneView, sample_to_packed_data, view_to_sample_image},
 };
-use brush_render::kernels::camera_model::pinhole::PinholeParams;
 use brush_render::{
     AlphaMode,
-    camera::{Camera, focal_to_fov},
+    camera::Camera,
     gaussian_splats::{SplatRenderMode, Splats},
-    kernels::camera_model::CameraModel,
 };
 use brush_serde::SplatData;
 use brush_train::{
@@ -24,23 +22,16 @@ use brush_train::{
 };
 use brush_vfs::BrushVfs;
 use burn::{module::AutodiffModule, tensor::Tensor};
-use image::{DynamicImage, GenericImageView, ImageFormat};
+use image::{DynamicImage, ImageFormat};
 use rand::{SeedableRng, seq::IndexedRandom};
-use std::fs::File;
-use std::{
-    collections::{HashMap, VecDeque},
-    fs,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use web_time::{Duration, Instant};
 
 pub struct FrameData {
-    pub t_ns: i64,
-    pub translation: glam::Vec3,
-    pub quat: glam::Quat,
+    pub poses: Vec<(i64, glam::Vec3, glam::Quat)>,
     pub landmarks: Vec<glam::Vec3>,
     /// Packed row-major grayscale u8 pixels, size = width * height.
+    pub image_frame_id: i64,
     pub image_data: Vec<u8>,
 }
 
@@ -132,13 +123,15 @@ pub async fn incremental_train_stream(
                 up_axis = Some(rot.y_axis)
             }
 
-            add_new_landmarks(
-                new_data.new_landmarks,
-                &mut splats,
-                &device,
-                render_mode,
-                sh_degree,
-            );
+            if new_data.new_landmarks.len() > 0 {
+                add_new_landmarks(
+                    new_data.new_landmarks,
+                    &mut splats,
+                    &device,
+                    render_mode,
+                    sh_degree,
+                );
+            }
 
             scene_views.extend(new_data.scene_views);
             views.extend(new_data.training_views);
@@ -292,14 +285,14 @@ pub struct NewTrainingData {
 
 impl NewTrainingData {
     pub fn build_from_frame_data(
-        fds: Vec<FrameData>,
+        poses_with_image: Vec<(i64, glam::Vec3, glam::Quat, Vec<u8>)>,
+        new_landmarks: Vec<glam::Vec3>,
         unit_camera: Camera,
         img_size: glam::UVec2,
         mask_path: PathBuf,
     ) -> Self {
         let mut training_views = vec![];
         let mut scene_views = vec![];
-        let mut new_landmarks = vec![];
 
         // TODO load mask only once
         let mask_disk = image::open(&mask_path).expect("failed to open mask image");
@@ -318,9 +311,8 @@ impl NewTrainingData {
         let mask_png_arc = Arc::new(mask_png_bytes);
         let mask_raw: Vec<u8> = mask_luma.into_raw();
 
-        for frame in fds {
-            let gray =
-                image::GrayImage::from_raw(img_size.x, img_size.y, frame.image_data).unwrap();
+        for (frame_id, translation, quat, image_data) in poses_with_image {
+            let gray = image::GrayImage::from_raw(img_size.x, img_size.y, image_data).unwrap();
 
             // Trainer input: RGBA where RGB replicates the grayscale value and
             // A holds the mask, so the AlphaMode::Masked path actually zeros
@@ -341,7 +333,7 @@ impl NewTrainingData {
                 .write_to(&mut std::io::Cursor::new(&mut png_bytes), ImageFormat::Png)
                 .unwrap();
 
-            let img_path = PathBuf::from(&format!("{}.png", frame.t_ns));
+            let img_path = PathBuf::from(&format!("{}.png", frame_id));
             let vfs = BrushVfs::from_entries(HashMap::from([
                 (img_path.clone(), Arc::new(png_bytes)),
                 (mask_path.clone(), mask_png_arc.clone()),
@@ -355,8 +347,8 @@ impl NewTrainingData {
             );
 
             let mut camera = unit_camera.clone();
-            camera.position = frame.translation;
-            camera.rotation = frame.quat;
+            camera.position = translation;
+            camera.rotation = quat;
 
             training_views.push(TrainingView {
                 camera,
@@ -366,10 +358,6 @@ impl NewTrainingData {
                 image: load_image,
                 camera,
             });
-
-            if !frame.landmarks.is_empty() {
-                new_landmarks.extend(frame.landmarks);
-            }
         }
 
         Self {

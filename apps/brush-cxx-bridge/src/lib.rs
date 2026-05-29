@@ -7,7 +7,7 @@ use brush_process::incremental_train_stream::{
 use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
 use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
-use glam::{Affine3A, Mat3A};
+use std::collections::HashMap;
 use std::mem;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,11 +31,17 @@ mod ffi {
     }
 
     #[namespace = "brush_cxx_bridge"]
-    struct FrameData {
-        t_ns: i64,
+    struct StampedPose {
+        frame_id: i64,
         translation: [f64; 3],
         quat: [f64; 4],
+    }
+
+    #[namespace = "brush_cxx_bridge"]
+    struct FrameData {
+        new_poses: Vec<StampedPose>,
         new_landmarks: Vec<Point>,
+        image_frame_id: i64,
         image_data: Vec<u8>,
     }
 
@@ -55,6 +61,7 @@ mod ffi {
             camera_model_id: CameraModelId,
             img_width: u32,
             img_height: u32,
+            mask_path: String,
         ) -> Result<()>;
     }
 }
@@ -85,18 +92,25 @@ fn fd_channel_take_receiver(channel: &mut Box<FrameDataChannel>) -> Box<FrameDat
 }
 
 fn send_fd(sender: &Box<FrameDataSender>, data: ffi::FrameData) {
-    let quat = glam::Quat::from_xyzw(
-        data.quat[0] as f32,
-        data.quat[1] as f32,
-        data.quat[2] as f32,
-        data.quat[3] as f32,
-    )
-    .normalize();
-    let translation = glam::Vec3::new(
-        data.translation[0] as f32,
-        data.translation[1] as f32,
-        data.translation[2] as f32,
-    );
+    let poses = data
+        .new_poses
+        .into_iter()
+        .map(|pose| {
+            let quat = glam::Quat::from_xyzw(
+                pose.quat[0] as f32,
+                pose.quat[1] as f32,
+                pose.quat[2] as f32,
+                pose.quat[3] as f32,
+            )
+            .normalize();
+            let translation = glam::Vec3::new(
+                pose.translation[0] as f32,
+                pose.translation[1] as f32,
+                pose.translation[2] as f32,
+            );
+            (pose.frame_id, translation, quat)
+        })
+        .collect();
 
     let landmarks: Vec<glam::Vec3> = data
         .new_landmarks
@@ -105,10 +119,9 @@ fn send_fd(sender: &Box<FrameDataSender>, data: ffi::FrameData) {
         .collect();
 
     let frame = ProcessFrameData {
-        t_ns: data.t_ns,
-        translation,
-        quat,
+        poses,
         landmarks,
+        image_frame_id: data.image_frame_id,
         image_data: data.image_data,
     };
 
@@ -123,18 +136,34 @@ async fn buffer_frame_data(
     flush_every: Duration,
     mask_path: PathBuf,
 ) {
-    let mut buffer = vec![];
+    let mut landmarks = vec![];
+    let mut poses = vec![];
+    let mut images = HashMap::new();
     let mut last_flush = Instant::now();
     let FrameDataReceiver(mut fd_receiver) = *fd_receiver;
 
     loop {
         let fd = fd_receiver.recv().await.unwrap();
-        buffer.push(fd);
+        landmarks.extend(fd.landmarks);
+        poses.extend(fd.poses);
+        images.insert(fd.image_frame_id, fd.image_data);
 
-        if !buffer.is_empty() && last_flush.elapsed() >= flush_every {
+        if !poses.is_empty() && last_flush.elapsed() >= flush_every {
+            let mut poses_with_image = vec![];
+            let mut poses_without_image = 0;
+            for (frame_id, translation, quat) in mem::take(&mut poses) {
+                if let Some(img) = images.remove(&frame_id) {
+                    poses_with_image.push((frame_id, translation, quat, img));
+                } else {
+                    poses_without_image += 1;
+                }
+            }
+            println!("left over poses without image: {}", poses_without_image);
+
             last_flush = Instant::now();
             let td = NewTrainingData::build_from_frame_data(
-                mem::take(&mut buffer),
+                poses_with_image,
+                mem::take(&mut landmarks),
                 unit_camera,
                 img_size,
                 mask_path.clone(),
@@ -150,9 +179,9 @@ fn run_brush_ui(
     camera_model_id: CameraModelId,
     img_width: u32,
     img_height: u32,
+    mask_path: String,
 ) -> anyhow::Result<()> {
-    //let mask_path = PathBuf::from("/datasets/monado/MI/MIO07_mapping_easy/mask.png");
-    let mask_path = PathBuf::from("/datasets/custom/mask.png");
+    let mask_path = PathBuf::from(mask_path);
     let mut config = TrainStreamConfig::default();
     //config.train_config.max_splats = 100000;
     config.train_config.refine_every = 500;
