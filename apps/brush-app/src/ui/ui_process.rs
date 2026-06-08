@@ -112,6 +112,10 @@ impl UiProcess {
         self.read().train_iter
     }
 
+    pub fn repaint(&self) {
+        self.read().repaint();
+    }
+
     pub fn get_cam_settings(&self) -> CameraSettings {
         self.read().controls.settings.clone()
     }

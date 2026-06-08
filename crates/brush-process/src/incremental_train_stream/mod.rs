@@ -294,6 +294,14 @@ impl IncrementalTrainContext {
                 new_data.views.len()
             );
 
+            if let Some(last_image) = new_data.views.last() {
+                self.emitter
+                    .emit(ProcessMessage::TrainMessage(TrainMessage::NewImage {
+                        image: last_image.image.clone(),
+                    }))
+                    .await;
+            }
+
             self.update_up_axis(&new_data);
 
             if new_data.new_landmarks_packed.len() > 0 {
@@ -309,7 +317,7 @@ impl IncrementalTrainContext {
                 self.total_views += 1;
             }
 
-            // TODO slow (blocking CPU) self.update_ui_dataset().await;
+            self.update_ui_dataset().await;
 
             if let Some(ref s) = self.splats {
                 log::info!(
@@ -373,14 +381,14 @@ impl IncrementalTrainContext {
             .training_views
             .iter()
             .map(|view| {
-                let mask_path = PathBuf::from("mask.png");
+                let img_path = PathBuf::from(&format!("{}.png", view.frame_id));
+                /*let mask_path = PathBuf::from("mask.png");
 
                 let mut png_bytes: Vec<u8> = Vec::new();
                 view.image
                     .write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)
                     .unwrap();
 
-                let img_path = PathBuf::from(&format!("{}.png", view.frame_id));
                 let vfs = BrushVfs::from_entries(HashMap::from([
                     (img_path.clone(), Arc::new(png_bytes)),
                     (mask_path.clone(), self.mask_image_png_bytes.clone()),
@@ -391,9 +399,15 @@ impl IncrementalTrainContext {
                     Some(mask_path),
                     u32::MAX,
                     Some(AlphaMode::Masked),
-                );
+                );*/
                 SceneView {
-                    image: load_image,
+                    image: LoadImage::new(
+                        Arc::new(BrushVfs::empty()),
+                        img_path,
+                        None,
+                        u32::MAX,
+                        None,
+                    ),
                     camera: view.camera,
                 }
             })

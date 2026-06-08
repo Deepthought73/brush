@@ -1,9 +1,9 @@
-use std::path::PathBuf;
-
+use crate::config::TrainStreamConfig;
 use brush_vfs::DataSource;
 use glam::Vec3;
-
-use crate::config::TrainStreamConfig;
+use image::DynamicImage;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 pub enum TrainMessage {
     /// Training configuration - sent at the start of training.
@@ -13,6 +13,10 @@ pub enum TrainMessage {
     /// Loaded a dataset to train on.
     Dataset {
         dataset: brush_dataset::Dataset,
+    },
+    /// Got new image, only in the incremental training scenario
+    NewImage {
+        image: Arc<DynamicImage>,
     },
     /// Some number of training steps are done.
     #[allow(unused)]

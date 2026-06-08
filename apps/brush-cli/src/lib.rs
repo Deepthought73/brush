@@ -244,6 +244,7 @@ pub async fn run_cli_ui(
                     ));
                 }
                 TrainMessage::DoneTraining => {}
+                _ => {}
             },
             ProcessMessage::DoneLoading => {
                 log::info!("Completed loading.");

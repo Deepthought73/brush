@@ -15,6 +15,7 @@ mod datasets;
 
 mod training_panel;
 
+mod last_image_panel;
 mod settings_panel;
 mod settings_popup;
 
