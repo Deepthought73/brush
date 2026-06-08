@@ -35,7 +35,8 @@ mod ffi {
         new_poses: Vec<StampedPose>,
         new_landmarks_packed: Vec<f32>,
         image_frame_id: i64,
-        image_data: Vec<u8>,
+        image_data: Vec<u16>,
+        depth_data: Vec<u16>,
     }
 
     #[namespace = "brush_cxx_bridge"]
@@ -106,6 +107,7 @@ fn send_fd(sender: &Box<FrameDataSender>, data: ffi::FrameData) {
         landmarks_packed: data.new_landmarks_packed,
         image_frame_id: data.image_frame_id,
         image_data: data.image_data,
+        depth_data: data.depth_data,
     };
 
     sender.0.send(frame).unwrap();
@@ -129,16 +131,13 @@ async fn buffer_frame_data(
         let fd = fd_receiver.recv().await.unwrap();
         landmarks_packed.extend(fd.landmarks_packed);
         poses.extend(fd.poses);
-        images.insert(fd.image_frame_id, fd.image_data);
+        images.insert(fd.image_frame_id, (fd.image_data, fd.depth_data));
 
         if !poses.is_empty() && last_flush.elapsed() >= flush_every {
             let mut poses_with_image = vec![];
-            let mut poses_without_image = 0;
             for (frame_id, translation, quat) in mem::take(&mut poses) {
-                if let Some(img) = images.remove(&frame_id) {
-                    poses_with_image.push((frame_id, translation, quat, img));
-                } else {
-                    poses_without_image += 1;
+                if let Some((img, depth_data)) = images.remove(&frame_id) {
+                    poses_with_image.push((frame_id, translation, quat, img, depth_data));
                 }
             }
 

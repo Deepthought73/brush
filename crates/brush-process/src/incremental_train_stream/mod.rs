@@ -34,7 +34,8 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 pub struct FrameData {
     pub poses: Vec<(i64, glam::Vec3, glam::Quat)>,
     pub landmarks_packed: Vec<f32>,
-    pub image_data: Vec<u8>,
+    pub image_data: Vec<u16>,
+    pub depth_data: Vec<u16>,
     /// Packed row-major grayscale u8 pixels, size = width * height.
     pub image_frame_id: i64,
 }
@@ -42,6 +43,7 @@ pub struct FrameData {
 pub struct ImageWithCamera {
     pub frame_id: i64,
     pub image: Arc<DynamicImage>,
+    pub depth_data: Vec<u16>,
     pub camera: Camera,
 }
 
@@ -465,7 +467,7 @@ pub struct NewTrainingData {
 
 impl NewTrainingData {
     pub fn build_from_frame_data(
-        poses_with_image: Vec<(i64, glam::Vec3, glam::Quat, Vec<u8>)>,
+        poses_with_image: Vec<(i64, glam::Vec3, glam::Quat, Vec<u16>, Vec<u16>)>,
         new_landmarks_packed: Vec<f32>,
         unit_camera: Camera,
         img_size: glam::UVec2,
@@ -480,19 +482,19 @@ impl NewTrainingData {
         }
         let mask_luma = mask_disk.to_luma8();
 
-        let mut mask_png_bytes: Vec<u8> = Vec::new();
-        DynamicImage::ImageLuma8(mask_luma.clone())
-            .write_to(&mut Cursor::new(&mut mask_png_bytes), ImageFormat::Png)
-            .unwrap();
         let mask_raw: Vec<u8> = mask_luma.into_raw();
 
-        for (frame_id, translation, quat, image_data) in poses_with_image {
-            let gray = image::GrayImage::from_raw(img_size.x, img_size.y, image_data).unwrap();
+        for (frame_id, translation, quat, image_data, depth_data) in poses_with_image {
+            let gray = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(
+                img_size.x, img_size.y, image_data,
+            )
+            .unwrap();
 
             let pixel_count = (img_size.x * img_size.y) as usize;
             let mut rgba_bytes = Vec::with_capacity(pixel_count * 4);
             for (g, m) in gray.as_raw().iter().zip(mask_raw.iter()) {
-                rgba_bytes.extend_from_slice(&[*g, *g, *g, *m]);
+                let g = (*g >> 8) as u8;
+                rgba_bytes.extend_from_slice(&[g, g, g, *m]);
             }
             let train_rgba = image::RgbaImage::from_raw(img_size.x, img_size.y, rgba_bytes)
                 .expect("rgba buffer size mismatch");
@@ -505,6 +507,7 @@ impl NewTrainingData {
             views.push(ImageWithCamera {
                 frame_id,
                 image: Arc::new(train_img),
+                depth_data,
                 camera,
             });
         }
