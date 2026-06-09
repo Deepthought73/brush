@@ -6,7 +6,6 @@ pub mod scene;
 pub mod scene_loader;
 
 mod formats;
-mod image_cache;
 
 pub use formats::{DatasetLoadResult, load_dataset};
 

@@ -1,12 +1,9 @@
-use std::sync::Arc;
-
-use crate::image_cache::ImageCache;
 use crate::scene::{Scene, SceneBatch, sample_to_packed_data, view_to_sample_image};
 use brush_async::Actor;
+use image::DynamicImage;
 use rand::{SeedableRng, seq::SliceRandom};
+use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-
-use crate::scene::{Scene, SceneBatch, sample_to_packed_data, view_to_sample_image};
 
 /// Cache budget for decoded source images. 6 GB on native; less on
 /// wasm since the whole heap is bounded by browser limits.
