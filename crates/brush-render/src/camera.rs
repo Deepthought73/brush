@@ -4,7 +4,8 @@ use crate::kernels::camera_model::CameraModel::{
 use crate::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use crate::kernels::camera_model::pinhole::PinholeParams;
 use crate::kernels::camera_model::radial_tangential_8::RadialTangential8Params;
-use crate::kernels::camera_model::{CameraModel, JacobianClampLimits};
+use crate::kernels::camera_model::{CameraModel, JacobianClampLimits, project};
+use brush_cube::Vec3A;
 use glam::Affine3A;
 use std::f64::consts::PI;
 
@@ -78,6 +79,18 @@ impl Camera {
 
     pub fn world_to_local(&self) -> Affine3A {
         self.local_to_world().inverse()
+    }
+
+    pub fn unproject(&self, uv: glam::Vec2, depth: f32, img_size: glam::UVec2) -> glam::Vec3 {
+        let PinholeParams { fx, fy, cx, cy } = self.build_pinhole_params(img_size);
+        match self.camera_model {
+            Pinhole => glam::Vec3::new((uv.x - cx) / fx, (uv.y - cy) / fy, 1.) * depth,
+            _ => todo!(),
+        }
+    }
+
+    pub fn transform(&self, point: glam::Vec3) -> glam::Vec3 {
+        self.rotation * point + self.position
     }
 }
 

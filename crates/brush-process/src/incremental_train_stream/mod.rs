@@ -11,6 +11,7 @@ use brush_dataset::{
     Dataset,
     scene::{SceneBatch, SceneView, sample_to_packed_data, view_to_sample_image},
 };
+use brush_render::shaders::SH_C0;
 use brush_render::{
     AlphaMode,
     camera::Camera,
@@ -24,7 +25,7 @@ use brush_train::{
 };
 use brush_vfs::BrushVfs;
 use burn::{module::AutodiffModule, tensor::Tensor};
-use image::{DynamicImage, ImageFormat, load};
+use image::{DynamicImage, GenericImage, GenericImageView, ImageFormat, load};
 use rand::rngs::StdRng;
 use rand::{SeedableRng, seq::IndexedRandom};
 use std::io::Cursor;
@@ -34,7 +35,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 pub struct FrameData {
     pub poses: Vec<(i64, glam::Vec3, glam::Quat)>,
     pub landmarks_packed: Vec<f32>,
-    pub image_data: Vec<u16>,
+    pub image: DynamicImage,
     pub depth_data: Vec<u16>,
     /// Packed row-major grayscale u8 pixels, size = width * height.
     pub image_frame_id: i64,
@@ -50,7 +51,7 @@ pub struct ImageWithCamera {
 pub fn create_incremental_training_process(
     training_data_receiver: tokio::sync::mpsc::UnboundedReceiver<NewTrainingData>,
     config: TrainStreamConfig,
-    mask_path: PathBuf,
+    mask_path: Option<PathBuf>,
 ) -> RunningProcess {
     let (splat_tx, splat_view) = crate::slot::channel();
 
@@ -83,8 +84,8 @@ pub struct IncrementalTrainContext {
     eval_views: Vec<ImageWithCamera>,
     splats: Option<Splats>,
     config: TrainStreamConfig,
-    mask_image_raw: Vec<u8>,
-    mask_image_png_bytes: Arc<Vec<u8>>,
+    mask_image_raw: Option<Vec<u8>>,
+    mask_image_png_bytes: Option<Arc<Vec<u8>>>,
 
     device: burn::tensor::Device,
     rng: StdRng,
@@ -103,22 +104,27 @@ impl IncrementalTrainContext {
         splat_sender: SlotSender<Splats>,
         emitter: TryStreamEmitter<ProcessMessage, anyhow::Error>,
         config: TrainStreamConfig,
-        mask_path: PathBuf,
+        mask_path: Option<PathBuf>,
     ) -> Self {
         let device: burn::tensor::Device = wait_for_device().await.clone().into();
         let rng = StdRng::from_seed([config.process_config.seed as u8; 32]);
         device.seed(config.process_config.seed);
 
-        let mask_img = image::open(&mask_path).unwrap().to_luma8();
-        let mut mask_image_png_bytes: Vec<u8> = Vec::new();
-        mask_img
-            .write_to(
-                &mut Cursor::new(&mut mask_image_png_bytes),
-                ImageFormat::Png,
-            )
-            .unwrap();
-        let mask_image_png_bytes = Arc::new(mask_image_png_bytes);
-        let mask_image_raw = mask_img.into_raw();
+        let (mask_image_png_bytes, mask_image_raw) = if let Some(mask_path) = mask_path {
+            let mask_img = image::open(&mask_path).unwrap().to_luma8();
+            let mut mask_image_png_bytes: Vec<u8> = Vec::new();
+            mask_img
+                .write_to(
+                    &mut Cursor::new(&mut mask_image_png_bytes),
+                    ImageFormat::Png,
+                )
+                .unwrap();
+            let mask_image_png_bytes = Arc::new(mask_image_png_bytes);
+            let mask_image_raw = mask_img.into_raw();
+            (Some(mask_image_png_bytes), Some(mask_image_raw))
+        } else {
+            (None, None)
+        };
 
         Self {
             training_data_receiver,
@@ -306,14 +312,15 @@ impl IncrementalTrainContext {
 
             self.update_up_axis(&new_data);
 
-            if new_data.new_landmarks_packed.len() > 0 {
-                self.add_new_landmarks(new_data.new_landmarks_packed);
-            }
+            // TODO if new_data.new_landmarks_packed.len() > 0 {
+            // TODO     self.add_new_landmarks(new_data.new_landmarks_packed);
+            // TODO }
 
             for view in new_data.views {
                 if self.total_views.is_multiple_of(20) {
                     self.eval_views.push(view);
                 } else {
+                    self.add_new_landmarks_by_depth(&view);
                     self.training_views.push(view);
                 }
                 self.total_views += 1;
@@ -336,7 +343,57 @@ impl IncrementalTrainContext {
         }
     }
 
-    fn add_new_landmarks(&mut self, new_landmarks_packed: Vec<f32>) {
+    fn add_new_landmarks_by_depth(&mut self, view: &ImageWithCamera) {
+        let mut means = vec![];
+        let mut sh_coeffs = vec![];
+        let mut log_scales = vec![];
+
+        let w = view.image.width() as usize;
+        let h = view.image.height() as usize;
+        let img_size = glam::UVec2::new(view.image.width(), view.image.height());
+
+        let raw_img = view.image.as_rgba8().unwrap().as_raw();
+
+        let stride = 10;
+        let focal = view.camera.focal(img_size);
+
+        for v in (0..h).step_by(stride) {
+            for u in (0..w).step_by(stride) {
+                let idx = v * w + u;
+                let d = view.depth_data[idx];
+                if d == 0 {
+                    continue;
+                }
+
+                // TODO depth is in mm, maybe preprocess somewhere else, if the unit changes
+                // TODO or: provide unit of depth in config
+                let d = d as f32 / 1000.;
+
+                let color = (raw_img[idx * 4] as f32 / 255.0 - 0.5) / SH_C0;
+
+                let uv = glam::Vec2::new(u as f32 + 0.5, v as f32 + 0.5);
+
+                let pos_cam = view.camera.unproject(uv, d, img_size);
+                let pos_world = view.camera.transform(pos_cam);
+                means.extend_from_slice(&[pos_world.x, pos_world.y, pos_world.z]);
+                sh_coeffs.extend_from_slice(&[color, color, color]);
+
+                // TODO: make this less magic
+                let scale = 4. * d / focal.x;
+                let log_s = scale.ln();
+                log_scales.extend_from_slice(&[log_s, log_s, log_s]);
+            }
+        }
+
+        self.add_new_landmarks_by_means(means, Some(sh_coeffs), Some(log_scales));
+    }
+
+    fn add_new_landmarks_by_means(
+        &mut self,
+        means: Vec<f32>,
+        sh_coeffs: Option<Vec<f32>>,
+        log_scales: Option<Vec<f32>>,
+    ) {
         let sh_degree = self.config.model_config.sh_degree;
         let render_mode = self
             .config
@@ -344,13 +401,12 @@ impl IncrementalTrainContext {
             .render_mode
             .unwrap_or(SplatRenderMode::Default);
 
-        let means: Vec<f32> = new_landmarks_packed;
         let new_splat = to_init_splats(
             SplatData {
                 means,
                 rotations: None,
-                log_scales: None,
-                sh_coeffs: None,
+                log_scales,
+                sh_coeffs,
                 raw_opacities: None,
             },
             render_mode,
@@ -384,7 +440,8 @@ impl IncrementalTrainContext {
             .iter()
             .map(|view| {
                 let img_path = PathBuf::from(&format!("{}.png", view.frame_id));
-                /*let mask_path = PathBuf::from("mask.png");
+                /*TODO remove this if not needed
+                let mask_path = PathBuf::from("mask.png");
 
                 let mut png_bytes: Vec<u8> = Vec::new();
                 view.image
@@ -467,46 +524,21 @@ pub struct NewTrainingData {
 
 impl NewTrainingData {
     pub fn build_from_frame_data(
-        poses_with_image: Vec<(i64, glam::Vec3, glam::Quat, Vec<u16>, Vec<u16>)>,
+        poses_with_image: Vec<(i64, glam::Vec3, glam::Quat, DynamicImage, Vec<u16>)>,
         new_landmarks_packed: Vec<f32>,
         unit_camera: Camera,
         img_size: glam::UVec2,
-        mask_path: PathBuf,
     ) -> Self {
         let mut views = vec![];
 
-        // TODO load mask only once
-        let mask_disk = image::open(&mask_path).expect("failed to open mask image");
-        if mask_disk.width() != img_size.x || mask_disk.height() != img_size.y {
-            panic!("mask image dimensions do not match");
-        }
-        let mask_luma = mask_disk.to_luma8();
-
-        let mask_raw: Vec<u8> = mask_luma.into_raw();
-
-        for (frame_id, translation, quat, image_data, depth_data) in poses_with_image {
-            let gray = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(
-                img_size.x, img_size.y, image_data,
-            )
-            .unwrap();
-
-            let pixel_count = (img_size.x * img_size.y) as usize;
-            let mut rgba_bytes = Vec::with_capacity(pixel_count * 4);
-            for (g, m) in gray.as_raw().iter().zip(mask_raw.iter()) {
-                let g = (*g >> 8) as u8;
-                rgba_bytes.extend_from_slice(&[g, g, g, *m]);
-            }
-            let train_rgba = image::RgbaImage::from_raw(img_size.x, img_size.y, rgba_bytes)
-                .expect("rgba buffer size mismatch");
-            let train_img = DynamicImage::ImageRgba8(train_rgba);
-
+        for (frame_id, translation, quat, image, depth_data) in poses_with_image {
             let mut camera = unit_camera.clone();
             camera.position = translation;
             camera.rotation = quat;
 
             views.push(ImageWithCamera {
                 frame_id,
-                image: Arc::new(train_img),
+                image: Arc::new(image),
                 depth_data,
                 camera,
             });
