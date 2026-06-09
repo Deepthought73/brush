@@ -190,6 +190,14 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             false,
             enabled,
         );
+        slider(
+            ui,
+            &mut tc.scale_ratio_penalty,
+            0.0..=1.0,
+            "Scale ratio penalty (anti-needle)",
+            false,
+            enabled,
+        );
     });
 
     ui.collapsing("Background", |ui| {
