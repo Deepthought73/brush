@@ -259,6 +259,25 @@ impl SplatTrainer {
                     ) * self.config.lpips_loss_weight;
             }
 
+            // Isotropy regulariser: penalise needle-shaped splats (one axis
+            // much longer than the others) without touching plane-shaped ones.
+            // Per splat we take the ratio of the largest to the median scale;
+            // a plane's two longest axes are ~equal so the ratio is ~1 and the
+            // `- 1` margin (with relu) zeroes both cost and gradient, while a
+            // needle's lone long axis drives the ratio up. Done in log space
+            // where the scale params live: `exp(log_max - log_median)`.
+            if self.config.scale_ratio_penalty > 0.0 {
+                let log_scales = splats.log_scales(); // [N, 3]
+                let log_max = log_scales.clone().max_dim(1);
+                let log_min = log_scales.clone().min_dim(1);
+                // median = sum - max - min, exact for exactly 3 elements.
+                let log_median = log_scales.sum_dim(1) - log_max.clone() - log_min;
+                let ratio = (log_max - log_median).exp(); // max_scale / median_scale, >= 1
+                loss = loss
+                    + ratio.sub_scalar(1.0).clamp_min(0.0).mean()
+                        * self.config.scale_ratio_penalty;
+            }
+
             // Strip the autodiff graph off the loss so consumers can read the
             // scalar later without keeping the backward pass alive.
             let loss_inner = loss.clone().inner();

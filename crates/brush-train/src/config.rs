@@ -85,6 +85,13 @@ pub struct TrainConfig {
     #[clap(long, help_heading = "Training options", default_value = "0.2")]
     pub ssim_weight: f32,
 
+    /// Isotropy regulariser weight. Penalises `max(scale) / median(scale)` per
+    /// splat to discourage needle-shaped gaussians (one axis much longer than
+    /// the others) while leaving plane-shaped ones (two comparable axes)
+    /// untouched. 0 disables it.
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    pub scale_ratio_penalty: f32,
+
     /// Factor of the opacity decay.
     #[arg(long, help_heading = "Training options", default_value = "0.004")]
     pub opac_decay: f32,
