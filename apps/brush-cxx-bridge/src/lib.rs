@@ -1,4 +1,4 @@
-use crate::ffi::CameraModelId;
+use crate::ffi::{BrushConfig, CameraModelId};
 use brush_app::ui::app::App;
 use brush_process::config::TrainStreamConfig;
 use brush_process::incremental_train_stream::{
@@ -18,6 +18,16 @@ use tokio::time::Instant;
 
 #[cxx::bridge]
 mod ffi {
+    #[namespace = "brush_cxx_bridge"]
+    struct BrushConfig {
+        max_splats: u32,
+        refine_every: u32,
+        eval_every: u32,
+        sh_degree: u32,
+        scale_ratio_penalty: f32,
+        lr: f64,
+    }
+
     #[namespace = "brush_cxx_bridge"]
     #[derive(Debug)]
     enum CameraModelId {
@@ -46,6 +56,7 @@ mod ffi {
         type BrushBridge;
 
         fn create_brush_bridge(
+            config: BrushConfig,
             camera_params: Vec<f64>,
             camera_model_id: CameraModelId,
             img_width: u32,
@@ -57,7 +68,22 @@ mod ffi {
     }
 }
 
+impl Default for BrushConfig {
+    fn default() -> Self {
+        Self {
+            max_splats: 5_000_000,
+            refine_every: 250,
+            eval_every: 500,
+            sh_degree: 0,
+            scale_ratio_penalty: 0.25,
+            lr: 2e-5,
+        }
+    }
+}
+
 struct BrushBridge {
+    config: BrushConfig,
+
     sender: UnboundedSender<FrameData>,
     receiver: Option<UnboundedReceiver<FrameData>>,
 
@@ -71,6 +97,7 @@ struct BrushBridge {
 }
 
 fn create_brush_bridge(
+    config: BrushConfig,
     camera_params: Vec<f64>,
     camera_model_id: CameraModelId,
     img_width: u32,
@@ -102,6 +129,7 @@ fn create_brush_bridge(
     };
 
     BrushBridge {
+        config,
         sender,
         receiver: Some(receiver),
         camera_params,
@@ -176,10 +204,14 @@ impl BrushBridge {
 
     fn run_ui(&mut self) -> anyhow::Result<()> {
         let mut config = TrainStreamConfig::default();
-        config.train_config.max_splats = 1_000_000;
-        config.train_config.refine_every = 500;
-        config.process_config.eval_every = 1000;
-        config.model_config.sh_degree = 0;
+        config.train_config.max_splats = self.config.max_splats;
+        config.train_config.refine_every = self.config.refine_every;
+        config.process_config.eval_every = self.config.eval_every;
+        config.model_config.sh_degree = self.config.sh_degree;
+        config.train_config.scale_ratio_penalty = self.config.scale_ratio_penalty;
+
+        config.train_config.lr_mean = self.config.lr;
+        config.train_config.lr_mean_end = config.train_config.lr_mean;
 
         let fx = self.camera_params[0];
         let fy = self.camera_params[1];
