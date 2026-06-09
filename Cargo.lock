@@ -870,6 +870,7 @@ version = "0.3.0"
 dependencies = [
  "android_logger",
  "anyhow",
+ "async-channel",
  "brush-async",
  "brush-cli",
  "brush-dataset",
@@ -1065,6 +1066,7 @@ dependencies = [
  "brush-process",
  "brush-render",
  "burn",
+ "console_error_panic_hook",
  "getrandom 0.3.4",
  "getrandom 0.4.2",
  "log",
@@ -1196,6 +1198,7 @@ dependencies = [
  "clap",
  "glam",
  "image",
+ "log",
  "rerun",
  "serde",
  "tokio",

@@ -2,19 +2,18 @@
 
 use brush_cube::{MainBackend, MainBackendBase};
 use brush_render::burn_glue::{
-    AutodiffMain, unwrap_ad_wgpu_float, wrap_ad_wgpu_float, wrap_wgpu_float,
+    AutodiffMain, lift_to_autodiff, unwrap_ad_wgpu_float, wrap_ad_wgpu_float, wrap_wgpu_float,
 };
 use brush_render::{
     SplatOps,
     camera::Camera,
-    gaussian_splats::{SplatRenderMode, Splats},
+    gaussian_splats::{SplatRenderMode, Splats, fold_min_scale},
     sh::sh_coeffs_for_degree,
     shaders::helpers::ProjectUniforms,
 };
 use burn::{
     backend::{
-        AutodiffBackend, Backend, BackendTensor, DispatchTensor, DispatchTensorKind,
-        TensorMetadata,
+        Backend, TensorMetadata,
         autodiff::{
             checkpoint::{base::Checkpointer, strategy::NoCheckpointing},
             grads::Gradients,
@@ -83,6 +82,7 @@ pub trait SplatBwdOps<B: Backend>: SplatOps<B> {
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<B>,
+        screen_area_penalty: f32,
     ) -> SplatGrads<B>;
 }
 
@@ -105,6 +105,7 @@ struct GaussianBackwardState<B: Backend> {
     pass: brush_render::gaussian_splats::RasterPass,
     background: Vec3,
     img_size: glam::UVec2,
+    screen_area_penalty: f32,
 }
 
 #[derive(Debug)]
@@ -155,6 +156,7 @@ impl<B: Backend + SplatBwdOps<B>> Backward<B, NUM_BWD_ARGS> for RenderBackwards 
             state.project_uniforms,
             state.render_mode,
             rasterize_grads.v_combined,
+            state.screen_area_penalty,
         );
 
         if let Some(node) = transforms_parent {
@@ -177,28 +179,14 @@ impl<B: Backend + SplatBwdOps<B>> Backward<B, NUM_BWD_ARGS> for RenderBackwards 
 }
 
 pub struct SplatOutputDiff {
+    /// Rendered image, on the autodiff graph (this is what the loss backprops through).
     pub img: Tensor<3>,
     pub num_visible: u32,
+    /// Per-splat visibility aux — on the **inner** backend (no gradients).
     pub visible: Tensor<1>,
+    /// Per-splat max screen radius aux — on the **inner** backend (no gradients).
     pub max_radius: Tensor<1>,
     pub refine_weight_holder: Tensor<1>,
-}
-
-/// Lift a non-autodiff `Tensor<D>` (on a Wgpu device) into the autodiff
-/// graph. Equivalent to `Tensor::from_inner` but additionally sets the
-/// `checkpointing` field that upstream burn-dispatch's `from_inner` leaves
-/// at `None`. Without that field set, ops on the resulting tensor hit
-/// `unreachable!("Should only be called with autodiff.")`.
-pub fn lift_to_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
-    let dispatch: DispatchTensor = t.into_primitive();
-    match dispatch.kind {
-        brush_render::wgpu_kind!(BackendTensor::Float(inner)) => {
-            wrap_ad_wgpu_float(<AutodiffMain as AutodiffBackend>::from_inner(inner))
-        }
-        // Already autodiff — no-op.
-        DispatchTensorKind::Autodiff(_) => Tensor::from_primitive(dispatch),
-        _ => panic!("expected Wgpu tensor to lift to autodiff"),
-    }
 }
 
 /// Equivalent to `Module::train()` for [`Splats`], routing through
@@ -206,6 +194,7 @@ pub fn lift_to_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
 /// instead of `splats.train()` until upstream burn-dispatch fixes `from_inner`.
 pub fn lift_splats_to_autodiff(splats: Splats) -> Splats {
     let mip = splats.render_mip;
+    let min_scale = splats.min_scale.clone();
     let (transforms_id, transforms, _) = splats.transforms.consume();
     let (sh_coeffs_id, sh_coeffs, _) = splats.sh_coeffs.consume();
     let (raw_opacity_id, raw_opacity, _) = splats.raw_opacities.consume();
@@ -217,6 +206,11 @@ pub fn lift_splats_to_autodiff(splats: Splats) -> Splats {
             lift_to_autodiff(raw_opacity).require_grad(),
         ),
         render_mip: mip,
+        // Keep the frozen floor on the inner backend. `#[module(skip)]` fields
+        // aren't converted by `.valid()`, so lifting it here would leave an
+        // autodiff `f` on an inner module after eval-strip and mix backends in
+        // `scales()`/`opacities()`. The bwd render lifts a temporary copy.
+        min_scale,
     }
 }
 
@@ -228,6 +222,7 @@ pub async fn render_splats(
     camera: &Camera,
     img_size: glam::UVec2,
     background: Vec3,
+    screen_area_penalty: f32,
 ) -> SplatOutputDiff {
     render_splats_with_pass(
         splats,
@@ -235,6 +230,7 @@ pub async fn render_splats(
         img_size,
         background,
         brush_render::gaussian_splats::RasterPass::Backward,
+        screen_area_penalty,
     )
     .await
 }
@@ -249,6 +245,7 @@ pub async fn render_splats_with_pass(
     img_size: glam::UVec2,
     background: Vec3,
     pass: brush_render::gaussian_splats::RasterPass,
+    screen_area_penalty: f32,
 ) -> SplatOutputDiff {
     splats.clone().validate_values().await;
 
@@ -260,9 +257,21 @@ pub async fn render_splats_with_pass(
 
     let refine_weight_holder = Tensor::<1>::zeros([1], &device).require_grad();
 
-    let transforms_ad = unwrap_ad_wgpu_float(splats.transforms.val());
+    // Fold the 3D-filter floor into scales/opacity for the render. `min_scale`
+    // lives on the inner backend; `fold_min_scale` lifts it onto the autodiff
+    // graph to match the param values.
+    let (transforms_val, raw_opac_val) = match &splats.min_scale {
+        Some(f) => fold_min_scale(
+            splats.transforms.val(),
+            splats.raw_opacities.val(),
+            f.clone(),
+        ),
+        None => (splats.transforms.val(), splats.raw_opacities.val()),
+    };
+
+    let transforms_ad = unwrap_ad_wgpu_float(transforms_val);
     let sh_coeffs_ad = unwrap_ad_wgpu_float(splats.sh_coeffs.val());
-    let raw_opac_ad = unwrap_ad_wgpu_float(splats.raw_opacities.val());
+    let raw_opac_ad = unwrap_ad_wgpu_float(raw_opac_val);
     let refine_weight_ad = unwrap_ad_wgpu_float(refine_weight_holder.clone());
 
     let prep_nodes = RenderBackwards
@@ -323,6 +332,7 @@ pub async fn render_splats_with_pass(
                 global_from_compact_gid: output.global_from_compact_gid,
                 background,
                 img_size,
+                screen_area_penalty,
             };
             prep.finish(state, output.out_img)
         }
@@ -332,8 +342,11 @@ pub async fn render_splats_with_pass(
     SplatOutputDiff {
         img: wrap_ad_wgpu_float(img_ad),
         num_visible,
-        visible: Tensor::from_inner(wrap_wgpu_float(visible_inner)),
-        max_radius: Tensor::from_inner(wrap_wgpu_float(max_radius_inner)),
+        // `visible` / `max_radius` are render aux — they only feed refine
+        // bookkeeping and never get a backward. Hand them back on the inner
+        // backend directly so callers don't have to strip autodiff off them.
+        visible: wrap_wgpu_float(visible_inner),
+        max_radius: wrap_wgpu_float(max_radius_inner),
         refine_weight_holder,
     }
 }
@@ -441,7 +454,13 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
+        screen_area_penalty: f32,
     ) -> SplatGrads<Self> {
+        // The screen-area regulariser only acts in the backward kernel, so we
+        // stamp the weight onto the uniforms here rather than in the forward.
+        let mut project_uniforms = project_uniforms;
+        project_uniforms.screen_area_penalty = screen_area_penalty;
+
         #[derive(Debug)]
         struct CustomOp {
             desc: CustomOpIr,
@@ -474,6 +493,8 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
                     self.project_uniforms,
                     self.render_mode,
                     h.get_float_tensor::<MainBackendBase>(v_combined_in),
+                    // Already stamped onto the uniforms by the outer project_bwd.
+                    self.project_uniforms.screen_area_penalty,
                 );
 
                 h.register_float_tensor::<MainBackendBase>(&v_transforms.id, grads.v_transforms);
