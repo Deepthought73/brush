@@ -1,5 +1,6 @@
 use clap::{Args, Parser};
 use serde::{Deserialize, Serialize};
+use crate::incremental_train_stream::config::IncrementalTrainConfig;
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -65,6 +66,9 @@ pub struct TrainStreamConfig {
     #[clap(flatten)]
     #[serde(flatten)]
     pub rerun_config: brush_rerun::RerunConfig,
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub incremental_train_config: IncrementalTrainConfig,
 }
 
 impl Default for TrainStreamConfig {

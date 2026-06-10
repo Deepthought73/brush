@@ -95,7 +95,7 @@ fn level_tag(level: Level) -> (&'static str, Color32) {
 }
 
 #[derive(Default)]
-pub(crate) struct LogPanel;
+pub struct LogPanel;
 
 impl AppPane for LogPanel {
     fn title(&self) -> egui::WidgetText {

@@ -1,16 +1,13 @@
+use crate::incremental_train_stream::view_sampling::{create_view_sampler, RandomViewSampler, ViewSampler};
 use crate::{
-    Emitter, RunningProcess,
+    RunningProcess,
     config::TrainStreamConfig,
     message::{ProcessMessage, TrainMessage},
     slot::SlotSender,
     wait_for_device,
 };
 use async_fn_stream::{TryStreamEmitter, try_fn_stream};
-use brush_dataset::scene::LoadImage;
-use brush_dataset::{
-    Dataset,
-    scene::{SceneBatch, SceneView, sample_to_packed_data, view_to_sample_image},
-};
+use brush_dataset::scene::{SceneBatch, sample_to_packed_data, view_to_sample_image};
 use brush_render::shaders::SH_C0;
 use brush_render::{
     AlphaMode,
@@ -23,14 +20,16 @@ use brush_train::{
     to_init_splats,
     train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds},
 };
-use brush_vfs::BrushVfs;
 use burn::{module::AutodiffModule, tensor::Tensor};
-use image::{DynamicImage, GenericImage, GenericImageView, ImageFormat, load};
+use image::DynamicImage;
 use rand::rngs::StdRng;
-use rand::{SeedableRng, seq::IndexedRandom};
-use std::io::Cursor;
+use rand::SeedableRng;
+use std::sync::Arc;
 use std::time::Instant;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+pub mod config;
+mod ui_interface;
+mod view_sampling;
 
 pub struct FrameData {
     pub poses: Vec<(i64, glam::Vec3, glam::Quat)>,
@@ -51,19 +50,12 @@ pub struct ImageWithCamera {
 pub fn create_incremental_training_process(
     training_data_receiver: tokio::sync::mpsc::UnboundedReceiver<NewTrainingData>,
     config: TrainStreamConfig,
-    mask_path: Option<PathBuf>,
 ) -> RunningProcess {
     let (splat_tx, splat_view) = crate::slot::channel();
 
     let stream = try_fn_stream(|emitter| async move {
-        let mut train_ctx = IncrementalTrainContext::new(
-            training_data_receiver,
-            splat_tx,
-            emitter,
-            config,
-            mask_path,
-        )
-        .await;
+        let mut train_ctx =
+            IncrementalTrainContext::new(training_data_receiver, splat_tx, emitter, config).await;
         train_ctx.init_ui().await;
         train_ctx.run_train_loop().await
     });
@@ -79,13 +71,12 @@ pub struct IncrementalTrainContext {
     trainer: Option<SplatTrainer>,
     training_iteration: u32,
     training_start: Instant,
+    view_sampler: Box<dyn ViewSampler>,
     total_views: usize,
     training_views: Vec<ImageWithCamera>,
     eval_views: Vec<ImageWithCamera>,
     splats: Option<Splats>,
     config: TrainStreamConfig,
-    mask_image_raw: Option<Vec<u8>>,
-    mask_image_png_bytes: Option<Arc<Vec<u8>>>,
 
     device: burn::tensor::Device,
     rng: StdRng,
@@ -104,27 +95,12 @@ impl IncrementalTrainContext {
         splat_sender: SlotSender<Splats>,
         emitter: TryStreamEmitter<ProcessMessage, anyhow::Error>,
         config: TrainStreamConfig,
-        mask_path: Option<PathBuf>,
     ) -> Self {
         let device: burn::tensor::Device = wait_for_device().await.clone().into();
         let rng = StdRng::from_seed([config.process_config.seed as u8; 32]);
         device.seed(config.process_config.seed);
 
-        let (mask_image_png_bytes, mask_image_raw) = if let Some(mask_path) = mask_path {
-            let mask_img = image::open(&mask_path).unwrap().to_luma8();
-            let mut mask_image_png_bytes: Vec<u8> = Vec::new();
-            mask_img
-                .write_to(
-                    &mut Cursor::new(&mut mask_image_png_bytes),
-                    ImageFormat::Png,
-                )
-                .unwrap();
-            let mask_image_png_bytes = Arc::new(mask_image_png_bytes);
-            let mask_image_raw = mask_img.into_raw();
-            (Some(mask_image_png_bytes), Some(mask_image_raw))
-        } else {
-            (None, None)
-        };
+        let view_sampler = create_view_sampler(&config.incremental_train_config.view_sampling_strategy);
 
         Self {
             training_data_receiver,
@@ -137,14 +113,13 @@ impl IncrementalTrainContext {
             training_start: Instant::now(),
             emitter,
             config,
-            mask_image_raw,
-            mask_image_png_bytes,
             device,
             rng,
             up_axis: None,
             splat_sender_initialized: false,
             up_axis_factor_count: 0.0,
             total_views: 0,
+            view_sampler,
         }
     }
 
@@ -254,35 +229,9 @@ impl IncrementalTrainContext {
         Ok(())
     }
 
-    async fn update_train_status_ui(&mut self) {
-        let (num_splats, sh) = self
-            .splats
-            .as_ref()
-            .map(|it| (it.num_splats(), it.sh_degree()))
-            .unwrap_or((0, 0));
-        self.emitter
-            .emit(ProcessMessage::SplatsUpdated {
-                up_axis: None,
-                frame: 0,
-                total_frames: 1,
-                num_splats,
-                sh_degree: sh,
-            })
-            .await;
-        self.emitter
-            .emit(ProcessMessage::TrainMessage(TrainMessage::TrainStep {
-                iter: self.training_iteration,
-                total_elapsed: self.training_start.elapsed(),
-                lod_progress: None,
-            }))
-            .await;
-    }
-
     fn get_next_train_batch(&mut self) -> SceneBatch {
-        let view = self
-            .training_views
-            .choose(&mut self.rng)
-            .expect("views non-empty");
+        let idx = self.view_sampler.sample(&mut self.rng);
+        let view = &self.training_views[idx];
         let alpha_mode = AlphaMode::Masked;
         let img = view_to_sample_image(view.image.as_ref().clone(), alpha_mode);
         let (img_packed, has_alpha) = sample_to_packed_data(img);
@@ -296,32 +245,23 @@ impl IncrementalTrainContext {
 
     async fn receive_new_training_data(&mut self) {
         while let Ok(new_data) = self.training_data_receiver.try_recv() {
-            log::info!(
-                "Adding new training data: {} landmarks, {} poses",
-                new_data.new_landmarks_packed.len(),
-                new_data.views.len()
-            );
+            log::info!("Received new {} new views", new_data.views.len());
 
-            if let Some(last_image) = new_data.views.last() {
-                self.emitter
-                    .emit(ProcessMessage::TrainMessage(TrainMessage::NewImage {
-                        image: last_image.image.clone(),
-                    }))
-                    .await;
+            self.update_last_images(new_data.views.last()).await;
+
+            if self.total_views < 50 {
+                self.update_up_axis(&new_data);
             }
 
-            self.update_up_axis(&new_data);
-
-            // TODO if new_data.new_landmarks_packed.len() > 0 {
-            // TODO     self.add_new_landmarks(new_data.new_landmarks_packed);
-            // TODO }
-
             for view in new_data.views {
-                if self.total_views.is_multiple_of(20) {
+                if let Some(n) = self.config.load_config.eval_split_every
+                    && self.total_views.is_multiple_of(n)
+                {
                     self.eval_views.push(view);
                 } else {
                     self.add_new_landmarks_by_depth(&view);
                     self.training_views.push(view);
+                    self.view_sampler.added_new_item();
                 }
                 self.total_views += 1;
             }
@@ -329,10 +269,6 @@ impl IncrementalTrainContext {
             self.update_ui_dataset().await;
 
             if let Some(ref s) = self.splats {
-                log::info!(
-                    "[brush-incremental] resetting trainer bounds ({} splats)",
-                    s.num_splats()
-                );
                 let bounds = get_splat_bounds(s.clone(), BOUND_PERCENTILE).await;
                 self.trainer = Some(SplatTrainer::new(
                     &self.config.train_config,
@@ -419,101 +355,6 @@ impl IncrementalTrainContext {
             Some(existing) => concat_splats(existing, new_splat, render_mode),
         });
     }
-
-    fn update_up_axis(&mut self, new_data: &NewTrainingData) {
-        for train_view in new_data.views.iter() {
-            let rot = glam::Mat3::from_quat(train_view.camera.rotation);
-            if self.up_axis.is_none() {
-                self.up_axis = Some(rot.y_axis)
-            } else if let Some(up_axis) = self.up_axis.as_mut() {
-                *up_axis *= self.up_axis_factor_count;
-                *up_axis += rot.y_axis;
-                *up_axis = up_axis.normalize();
-            }
-            self.up_axis_factor_count += 1.;
-        }
-    }
-
-    async fn update_ui_dataset(&self) {
-        let views = self
-            .training_views
-            .iter()
-            .map(|view| {
-                let img_path = PathBuf::from(&format!("{}.png", view.frame_id));
-                /*TODO remove this if not needed
-                let mask_path = PathBuf::from("mask.png");
-
-                let mut png_bytes: Vec<u8> = Vec::new();
-                view.image
-                    .write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)
-                    .unwrap();
-
-                let vfs = BrushVfs::from_entries(HashMap::from([
-                    (img_path.clone(), Arc::new(png_bytes)),
-                    (mask_path.clone(), self.mask_image_png_bytes.clone()),
-                ]));
-                let load_image = LoadImage::new(
-                    Arc::new(vfs),
-                    img_path,
-                    Some(mask_path),
-                    u32::MAX,
-                    Some(AlphaMode::Masked),
-                );*/
-                SceneView {
-                    image: LoadImage::new(
-                        Arc::new(BrushVfs::empty()),
-                        img_path,
-                        None,
-                        u32::MAX,
-                        None,
-                    ),
-                    camera: view.camera,
-                }
-            })
-            .collect();
-
-        self.emitter
-            .emit(ProcessMessage::TrainMessage(TrainMessage::Dataset {
-                dataset: Dataset::from_views(views, vec![]),
-            }))
-            .await;
-    }
-
-    async fn update_splat_in_ui(&mut self) {
-        if let Some(splats) = &self.splats {
-            self.splat_sender.set(0, splats.clone());
-            if !self.splat_sender_initialized {
-                self.splat_sender_initialized = true;
-                self.emitter.emit(ProcessMessage::DoneLoading).await;
-            }
-            self.emitter
-                .emit(ProcessMessage::SplatsUpdated {
-                    up_axis: self.up_axis,
-                    frame: 0,
-                    total_frames: 1,
-                    num_splats: splats.num_splats(),
-                    sh_degree: splats.sh_degree(),
-                })
-                .await;
-        }
-    }
-
-    async fn init_ui(&mut self) {
-        self.emitter.emit(ProcessMessage::NewProcess).await;
-        self.emitter
-            .emit(ProcessMessage::StartLoading {
-                name: "incremental".to_owned(),
-                source: brush_vfs::DataSource::Path("incremental".to_owned()),
-                training: true,
-                base_path: None,
-            })
-            .await;
-        self.emitter
-            .emit(ProcessMessage::TrainMessage(TrainMessage::TrainConfig {
-                config: Box::new(self.config.clone()),
-            }))
-            .await;
-    }
 }
 
 pub struct NewTrainingData {
@@ -527,7 +368,6 @@ impl NewTrainingData {
         poses_with_image: Vec<(i64, glam::Vec3, glam::Quat, DynamicImage, Vec<u16>)>,
         new_landmarks_packed: Vec<f32>,
         unit_camera: Camera,
-        img_size: glam::UVec2,
     ) -> Self {
         let mut views = vec![];
 

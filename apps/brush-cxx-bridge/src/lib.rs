@@ -1,4 +1,3 @@
-use crate::ffi::{BrushConfig, CameraModelId};
 use brush_app::ui::app::App;
 use brush_process::config::TrainStreamConfig;
 use brush_process::incremental_train_stream::{
@@ -9,25 +8,17 @@ use brush_render::kernels::camera_model::CameraModel;
 use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use image::DynamicImage;
 use std::collections::HashMap;
-use std::mem;
+use std::fs::File;
+use std::{fs, mem};
 use std::path::PathBuf;
 use std::process::exit;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
+use crate::ffi::CameraModelId;
 
 #[cxx::bridge]
 mod ffi {
-    #[namespace = "brush_cxx_bridge"]
-    struct BrushConfig {
-        max_splats: u32,
-        refine_every: u32,
-        eval_every: u32,
-        sh_degree: u32,
-        scale_ratio_penalty: f32,
-        lr: f64,
-    }
-
     #[namespace = "brush_cxx_bridge"]
     #[derive(Debug)]
     enum CameraModelId {
@@ -56,7 +47,7 @@ mod ffi {
         type BrushBridge;
 
         fn create_brush_bridge(
-            config: BrushConfig,
+            config_path: String,
             camera_params: Vec<f64>,
             camera_model_id: CameraModelId,
             img_width: u32,
@@ -68,21 +59,8 @@ mod ffi {
     }
 }
 
-impl Default for BrushConfig {
-    fn default() -> Self {
-        Self {
-            max_splats: 5_000_000,
-            refine_every: 250,
-            eval_every: 500,
-            sh_degree: 0,
-            scale_ratio_penalty: 0.25,
-            lr: 2e-5,
-        }
-    }
-}
-
 struct BrushBridge {
-    config: BrushConfig,
+    config: TrainStreamConfig,
 
     sender: UnboundedSender<FrameData>,
     receiver: Option<UnboundedReceiver<FrameData>>,
@@ -92,12 +70,11 @@ struct BrushBridge {
     img_width: u32,
     img_height: u32,
 
-    mask_path: Option<PathBuf>,
     mask_raw: Option<Vec<u8>>,
 }
 
 fn create_brush_bridge(
-    config: BrushConfig,
+    config_path: String,
     camera_params: Vec<f64>,
     camera_model_id: CameraModelId,
     img_width: u32,
@@ -106,15 +83,27 @@ fn create_brush_bridge(
 ) -> Box<BrushBridge> {
     let (sender, receiver) = unbounded_channel::<FrameData>();
 
-    let (mask_raw, mask_path) = if mask_path.is_empty() {
-        (None, None)
+    let config = if config_path.is_empty() {
+        TrainStreamConfig::default()
+    } else {
+        let config_path = PathBuf::from(config_path);
+        if fs::exists(&config_path).unwrap_or(false) {
+            serde_json::from_reader(File::open(&config_path).expect("Error reading config")).unwrap()
+        } else {
+            serde_json::to_writer(File::create(&config_path).unwrap(), &TrainStreamConfig::default()).unwrap();
+            TrainStreamConfig::default()
+        }
+    };
+
+    let mask_raw = if mask_path.is_empty() {
+        None
     } else {
         let mask_img = image::open(&mask_path).expect("failed to open mask image");
         if mask_img.width() != img_width || mask_img.height() != img_height {
             println!("mask image dimensions do not match");
             exit(1);
         }
-        (Some(mask_img.to_luma8().into_raw()), Some(mask_path.into()))
+        Some(mask_img.to_luma8().into_raw())
     };
 
     let camera_model = match camera_model_id {
@@ -136,10 +125,9 @@ fn create_brush_bridge(
         camera_model,
         img_width,
         img_height,
-        mask_path,
         mask_raw,
     }
-    .into()
+        .into()
 }
 
 impl BrushBridge {
@@ -203,16 +191,6 @@ impl BrushBridge {
     }
 
     fn run_ui(&mut self) -> anyhow::Result<()> {
-        let mut config = TrainStreamConfig::default();
-        config.train_config.max_splats = self.config.max_splats;
-        config.train_config.refine_every = self.config.refine_every;
-        config.process_config.eval_every = self.config.eval_every;
-        config.model_config.sh_degree = self.config.sh_degree;
-        config.train_config.scale_ratio_penalty = self.config.scale_ratio_penalty;
-
-        config.train_config.lr_mean = self.config.lr;
-        config.train_config.lr_mean_end = config.train_config.lr_mean;
-
         let fx = self.camera_params[0];
         let fy = self.camera_params[1];
         let cx = self.camera_params[2];
@@ -229,8 +207,6 @@ impl BrushBridge {
             self.camera_model,
         );
 
-        let img_size = glam::UVec2::new(self.img_width, self.img_height);
-
         let flush_every = Duration::from_secs(1);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -243,15 +219,10 @@ impl BrushBridge {
             mem::take(&mut self.receiver).unwrap(),
             training_data_sender,
             unit_camera,
-            img_size,
             flush_every,
         ));
 
-        let process = create_incremental_training_process(
-            training_data_receiver,
-            config,
-            self.mask_path.clone(),
-        );
+        let process = create_incremental_training_process(training_data_receiver, self.config.clone());
 
         runtime.block_on(async move {
             let logger = env_logger::Builder::from_default_env()
@@ -260,29 +231,17 @@ impl BrushBridge {
             let max = logger.filter();
             brush_app::ui::log_panel::install_global_logger(Box::new(logger), max);
 
-            let icon = eframe::icon_data::from_png_bytes(
-                &include_bytes!("../../brush-app/assets/icon-256.png")[..],
-            )
-            .expect("Failed to load icon");
-
             let native_options = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
                     .with_inner_size(egui::Vec2::new(1450.0, 1200.0))
-                    .with_active(true)
-                    .with_icon(std::sync::Arc::new(icon)),
+                    .with_active(true),
                 wgpu_options: brush_app::ui::create_egui_options(),
                 persist_window: true,
                 ..Default::default()
             };
 
-            let title = if cfg!(debug_assertions) {
-                "Brush  -  Debug"
-            } else {
-                "Brush"
-            };
-
             eframe::run_native(
-                title,
+                "Incremental Brush",
                 native_options,
                 Box::new(move |cc| Ok(Box::new(App::new(cc, Some(process))))),
             )?;
@@ -298,7 +257,6 @@ async fn buffer_frame_data(
     mut fd_receiver: UnboundedReceiver<FrameData>,
     training_data_sender: UnboundedSender<NewTrainingData>,
     unit_camera: Camera,
-    img_size: glam::UVec2,
     flush_every: Duration,
 ) {
     let mut landmarks_packed = vec![];
@@ -325,7 +283,6 @@ async fn buffer_frame_data(
                 poses_with_image,
                 mem::take(&mut landmarks_packed),
                 unit_camera,
-                img_size,
             );
             training_data_sender.send(td).unwrap();
         }

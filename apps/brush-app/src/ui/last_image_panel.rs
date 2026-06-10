@@ -1,12 +1,10 @@
-use crate::ui::draw_checkerboard;
 use crate::ui::panels::AppPane;
 use crate::ui::ui_process::UiProcess;
 use brush_process::message::{ProcessMessage, TrainMessage};
-use brush_render::AlphaMode;
 use eframe::emath::pos2;
 use eframe::epaint::Color32;
-use egui::{ColorImage, TextureHandle, TextureOptions, Ui, WidgetText};
-use image::{RgbImage, RgbaImage};
+use egui::{ColorImage, TextureOptions, Ui, WidgetText};
+use image::RgbImage;
 
 #[derive(Default)]
 pub struct LastImagePanel {

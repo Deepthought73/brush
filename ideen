@@ -1,0 +1,5 @@
+- optimize poses
+- use loop closure
+- add depth loss
+- add gaussians only in empty areas
+- remove densification

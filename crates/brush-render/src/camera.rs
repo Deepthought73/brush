@@ -4,8 +4,7 @@ use crate::kernels::camera_model::CameraModel::{
 use crate::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use crate::kernels::camera_model::pinhole::PinholeParams;
 use crate::kernels::camera_model::radial_tangential_8::RadialTangential8Params;
-use crate::kernels::camera_model::{CameraModel, JacobianClampLimits, project};
-use brush_cube::Vec3A;
+use crate::kernels::camera_model::{CameraModel, JacobianClampLimits};
 use glam::Affine3A;
 use std::f64::consts::PI;
 

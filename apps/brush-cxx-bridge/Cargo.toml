@@ -43,6 +43,8 @@ humantime.workspace = true
 
 bytemuck = { version = "1.14", features = ["derive"] }
 
+serde_json.workspace = true
+
 image = { workspace = true }
 
 winit = { version = "0.30", features = ["default"] }
