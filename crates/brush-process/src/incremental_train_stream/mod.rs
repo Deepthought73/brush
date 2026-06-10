@@ -1,4 +1,6 @@
-use crate::incremental_train_stream::view_sampling::{create_view_sampler, RandomViewSampler, ViewSampler};
+use crate::incremental_train_stream::view_sampling::{
+    RandomViewSampler, ViewSampler, create_view_sampler,
+};
 use crate::{
     RunningProcess,
     config::TrainStreamConfig,
@@ -22,14 +24,17 @@ use brush_train::{
 };
 use burn::{module::AutodiffModule, tensor::Tensor};
 use image::DynamicImage;
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
+use crate::incremental_train_stream::landmark_householding::OccupancyGrid;
 
 pub mod config;
 mod ui_interface;
 mod view_sampling;
+mod landmark_householding;
 
 pub struct FrameData {
     pub poses: Vec<(i64, glam::Vec3, glam::Quat)>,
@@ -39,6 +44,7 @@ pub struct FrameData {
     /// Packed row-major grayscale u8 pixels, size = width * height.
     pub image_frame_id: i64,
 }
+
 
 pub struct ImageWithCamera {
     pub frame_id: i64,
@@ -78,6 +84,8 @@ pub struct IncrementalTrainContext {
     splats: Option<Splats>,
     config: TrainStreamConfig,
 
+    occupancy_grid: Option<OccupancyGrid>,
+
     device: burn::tensor::Device,
     rng: StdRng,
 
@@ -100,7 +108,8 @@ impl IncrementalTrainContext {
         let rng = StdRng::from_seed([config.process_config.seed as u8; 32]);
         device.seed(config.process_config.seed);
 
-        let view_sampler = create_view_sampler(&config.incremental_train_config.view_sampling_strategy);
+        let view_sampler =
+            create_view_sampler(&config.incremental_train_config.view_sampling_strategy);
 
         Self {
             training_data_receiver,
@@ -113,6 +122,7 @@ impl IncrementalTrainContext {
             training_start: Instant::now(),
             emitter,
             config,
+            occupancy_grid: None,
             device,
             rng,
             up_axis: None,
@@ -151,6 +161,7 @@ impl IncrementalTrainContext {
 
     async fn train_step(&mut self) {
         self.training_iteration += 1;
+        self.occupancy_grid = None;
 
         let batch = self.get_next_train_batch();
 
@@ -259,7 +270,10 @@ impl IncrementalTrainContext {
                 {
                     self.eval_views.push(view);
                 } else {
-                    self.add_new_landmarks_by_depth(&view);
+                    let start = Instant::now();
+                    self.add_new_landmarks_by_depth(&view).await;
+                    let elapsed = start.elapsed();
+                    log::info!("Adding new landmarks took: {:?}", elapsed);
                     self.training_views.push(view);
                     self.view_sampler.added_new_item();
                 }
@@ -277,83 +291,6 @@ impl IncrementalTrainContext {
                 ));
             }
         }
-    }
-
-    fn add_new_landmarks_by_depth(&mut self, view: &ImageWithCamera) {
-        let mut means = vec![];
-        let mut sh_coeffs = vec![];
-        let mut log_scales = vec![];
-
-        let w = view.image.width() as usize;
-        let h = view.image.height() as usize;
-        let img_size = glam::UVec2::new(view.image.width(), view.image.height());
-
-        let raw_img = view.image.as_rgba8().unwrap().as_raw();
-
-        let stride = 10;
-        let focal = view.camera.focal(img_size);
-
-        for v in (0..h).step_by(stride) {
-            for u in (0..w).step_by(stride) {
-                let idx = v * w + u;
-                let d = view.depth_data[idx];
-                if d == 0 {
-                    continue;
-                }
-
-                // TODO depth is in mm, maybe preprocess somewhere else, if the unit changes
-                // TODO or: provide unit of depth in config
-                let d = d as f32 / 1000.;
-
-                let color = (raw_img[idx * 4] as f32 / 255.0 - 0.5) / SH_C0;
-
-                let uv = glam::Vec2::new(u as f32 + 0.5, v as f32 + 0.5);
-
-                let pos_cam = view.camera.unproject(uv, d, img_size);
-                let pos_world = view.camera.transform(pos_cam);
-                means.extend_from_slice(&[pos_world.x, pos_world.y, pos_world.z]);
-                sh_coeffs.extend_from_slice(&[color, color, color]);
-
-                // TODO: make this less magic
-                let scale = 4. * d / focal.x;
-                let log_s = scale.ln();
-                log_scales.extend_from_slice(&[log_s, log_s, log_s]);
-            }
-        }
-
-        self.add_new_landmarks_by_means(means, Some(sh_coeffs), Some(log_scales));
-    }
-
-    fn add_new_landmarks_by_means(
-        &mut self,
-        means: Vec<f32>,
-        sh_coeffs: Option<Vec<f32>>,
-        log_scales: Option<Vec<f32>>,
-    ) {
-        let sh_degree = self.config.model_config.sh_degree;
-        let render_mode = self
-            .config
-            .train_config
-            .render_mode
-            .unwrap_or(SplatRenderMode::Default);
-
-        let new_splat = to_init_splats(
-            SplatData {
-                means,
-                rotations: None,
-                log_scales,
-                sh_coeffs,
-                raw_opacities: None,
-            },
-            render_mode,
-            &self.device,
-        )
-        .with_sh_degree(sh_degree);
-
-        self.splats = Some(match self.splats.take() {
-            None => new_splat,
-            Some(existing) => concat_splats(existing, new_splat, render_mode),
-        });
     }
 }
 
