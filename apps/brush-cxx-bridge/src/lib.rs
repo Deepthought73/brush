@@ -1,7 +1,9 @@
+use crate::ffi::{CameraModelId, ReconstructionInput};
 use brush_app::ui::app::App;
 use brush_process::config::TrainStreamConfig;
 use brush_process::incremental_train_stream::{
-    FrameData as ProcessFrameData, FrameData, NewTrainingData, create_incremental_training_process,
+    NewTrainingData, ReconstructionInput as ProcessedReconstructionInput,
+    create_incremental_training_process,
 };
 use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
@@ -9,13 +11,12 @@ use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use image::DynamicImage;
 use std::collections::HashMap;
 use std::fs::File;
-use std::{fs, mem};
 use std::path::PathBuf;
 use std::process::exit;
 use std::time::Duration;
+use std::{fs, mem};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
-use crate::ffi::CameraModelId;
 
 #[cxx::bridge]
 mod ffi {
@@ -34,12 +35,17 @@ mod ffi {
     }
 
     #[namespace = "brush_cxx_bridge"]
-    struct FrameData {
-        new_poses: Vec<StampedPose>,
-        new_landmarks_packed: Vec<f32>,
-        image_frame_id: i64,
+    struct ImageData {
+        frame_id: i64,
         image_ptr: *const u16,
         depth_ptr: *const u16,
+    }
+
+    #[namespace = "brush_cxx_bridge"]
+    struct ReconstructionInput {
+        poses: Vec<StampedPose>,
+        landmarks_packed: Vec<f32>,
+        images: Vec<ImageData>,
     }
 
     #[namespace = "brush_cxx_bridge"]
@@ -54,7 +60,7 @@ mod ffi {
             img_height: u32,
             mask_path: String,
         ) -> Box<BrushBridge>;
-        fn send_fd(&self, data: FrameData);
+        fn send_data(&self, data: ReconstructionInput);
         fn run_ui(&mut self) -> Result<()>;
     }
 }
@@ -62,8 +68,8 @@ mod ffi {
 struct BrushBridge {
     config: TrainStreamConfig,
 
-    sender: UnboundedSender<FrameData>,
-    receiver: Option<UnboundedReceiver<FrameData>>,
+    sender: UnboundedSender<ProcessedReconstructionInput>,
+    receiver: Option<UnboundedReceiver<ProcessedReconstructionInput>>,
 
     camera_params: Vec<f64>,
     camera_model: CameraModel,
@@ -81,16 +87,21 @@ fn create_brush_bridge(
     img_height: u32,
     mask_path: String,
 ) -> Box<BrushBridge> {
-    let (sender, receiver) = unbounded_channel::<FrameData>();
+    let (sender, receiver) = unbounded_channel::<ProcessedReconstructionInput>();
 
     let config = if config_path.is_empty() {
         TrainStreamConfig::default()
     } else {
         let config_path = PathBuf::from(config_path);
         if fs::exists(&config_path).unwrap_or(false) {
-            serde_json::from_reader(File::open(&config_path).expect("Error reading config")).unwrap()
+            serde_json::from_reader(File::open(&config_path).expect("Error reading config"))
+                .unwrap()
         } else {
-            serde_json::to_writer(File::create(&config_path).unwrap(), &TrainStreamConfig::default()).unwrap();
+            serde_json::to_writer(
+                File::create(&config_path).unwrap(),
+                &TrainStreamConfig::default(),
+            )
+            .unwrap();
             TrainStreamConfig::default()
         }
     };
@@ -127,13 +138,13 @@ fn create_brush_bridge(
         img_height,
         mask_raw,
     }
-        .into()
+    .into()
 }
 
 impl BrushBridge {
-    fn send_fd(&self, data: ffi::FrameData) {
+    fn send_data(&self, data: ReconstructionInput) {
         let poses = data
-            .new_poses
+            .poses
             .into_iter()
             .map(|pose| {
                 let quat =
@@ -148,46 +159,49 @@ impl BrushBridge {
             })
             .collect();
 
-        // TODO try grayscale only training (probably requires heavy modifications)
-        let pixel_count = (self.img_width * self.img_height) as usize;
-        let mut rgba_bytes = Vec::with_capacity(pixel_count * 4);
+        let images = data
+            .images
+            .into_iter()
+            .map(|image_data| {
+                let pixel_count = (self.img_width * self.img_height) as usize;
+                let mut rgba_bytes = Vec::with_capacity(pixel_count * 4);
 
-        if data.image_ptr.is_null() {
-            println!("WTF, image ptr is null");
-            exit(1);
-        }
+                let image_slice =
+                    unsafe { std::slice::from_raw_parts(image_data.image_ptr, pixel_count) };
+                if let Some(mask) = &self.mask_raw {
+                    for i in 0..pixel_count {
+                        let g = (image_slice[i] >> 8) as u8;
+                        let m = mask[i];
+                        rgba_bytes.extend_from_slice(&[g, g, g, m]);
+                    }
+                } else {
+                    for i in 0..pixel_count {
+                        let g = (image_slice[i] >> 8) as u8;
+                        rgba_bytes.extend_from_slice(&[g, g, g, 255]);
+                    }
+                }
 
-        let image_slice = unsafe { std::slice::from_raw_parts(data.image_ptr, pixel_count) };
-        if let Some(mask) = &self.mask_raw {
-            for i in 0..pixel_count {
-                let g = (image_slice[i] >> 8) as u8;
-                let m = mask[i];
-                rgba_bytes.extend_from_slice(&[g, g, g, m]);
-            }
-        } else {
-            for i in 0..pixel_count {
-                let g = (image_slice[i] >> 8) as u8;
-                rgba_bytes.extend_from_slice(&[g, g, g, 255]);
-            }
-        }
+                let image = DynamicImage::ImageRgba8(
+                    image::RgbaImage::from_raw(self.img_width, self.img_height, rgba_bytes)
+                        .unwrap(),
+                );
 
-        let image = DynamicImage::ImageRgba8(
-            image::RgbaImage::from_raw(self.img_width, self.img_height, rgba_bytes).unwrap(),
-        );
+                // TODO try to pass depth data as shared_ptr to avoid copy
+                let depth_slice =
+                    unsafe { std::slice::from_raw_parts(image_data.depth_ptr, pixel_count) };
+                let depth_data = depth_slice.to_vec();
 
-        // TODO try to pass depth data as shared_ptr to avoid copy
-        let depth_slice = unsafe { std::slice::from_raw_parts(data.depth_ptr, pixel_count) };
-        let depth_data = depth_slice.to_vec();
+                (image_data.frame_id, image, depth_data)
+            })
+            .collect();
 
-        let frame = ProcessFrameData {
+        let input = ProcessedReconstructionInput {
             poses,
-            landmarks_packed: data.new_landmarks_packed,
-            image_frame_id: data.image_frame_id,
-            image,
-            depth_data,
+            landmarks_packed: data.landmarks_packed,
+            images,
         };
 
-        self.sender.send(frame).unwrap();
+        self.sender.send(input).unwrap();
     }
 
     fn run_ui(&mut self) -> anyhow::Result<()> {
@@ -215,14 +229,15 @@ impl BrushBridge {
             .expect("Failed to initialize tokio runtime");
 
         let (training_data_sender, training_data_receiver) = unbounded_channel();
-        runtime.spawn(buffer_frame_data(
+        runtime.spawn(buffer_reconstruction_data(
             mem::take(&mut self.receiver).unwrap(),
             training_data_sender,
             unit_camera,
             flush_every,
         ));
 
-        let process = create_incremental_training_process(training_data_receiver, self.config.clone());
+        let process =
+            create_incremental_training_process(training_data_receiver, self.config.clone());
 
         runtime.block_on(async move {
             let logger = env_logger::Builder::from_default_env()
@@ -253,8 +268,8 @@ impl BrushBridge {
     }
 }
 
-async fn buffer_frame_data(
-    mut fd_receiver: UnboundedReceiver<FrameData>,
+async fn buffer_reconstruction_data(
+    mut receiver: UnboundedReceiver<ProcessedReconstructionInput>,
     training_data_sender: UnboundedSender<NewTrainingData>,
     unit_camera: Camera,
     flush_every: Duration,
@@ -265,10 +280,12 @@ async fn buffer_frame_data(
     let mut last_flush = Instant::now();
 
     loop {
-        let fd = fd_receiver.recv().await.unwrap();
-        landmarks_packed.extend(fd.landmarks_packed);
-        poses.extend(fd.poses);
-        images.insert(fd.image_frame_id, (fd.image, fd.depth_data));
+        let input = receiver.recv().await.unwrap();
+        landmarks_packed.extend(input.landmarks_packed);
+        poses.extend(input.poses);
+        for (frame_id, image, depth_data) in input.images {
+            images.insert(frame_id, (image, depth_data));
+        }
 
         if !poses.is_empty() && last_flush.elapsed() >= flush_every {
             let mut poses_with_image = vec![];
@@ -279,7 +296,7 @@ async fn buffer_frame_data(
             }
 
             last_flush = Instant::now();
-            let td = NewTrainingData::build_from_frame_data(
+            let td = NewTrainingData::build_from_reconstruction_input(
                 poses_with_image,
                 mem::take(&mut landmarks_packed),
                 unit_camera,

@@ -1,14 +1,16 @@
-
 - loop closure
 
-- which points to send to brush
-
 - training convergence:
-    - better densification:
-        - 
+    - better densification
 
-- when to train what?
-    - importance sampling of images dependent on number of training steps using this image
-    - only use n last images for training -> requires marginalized region to be reasonably reconstructed
+- optimize poses while training GS
 
-- isotropic regularization loss to stabilize boundary gaussians
+- add depth loss
+
+- add gaussians only in empty areas
+
+- remove densification
+
+- look into memory allocations for images, when is what copied or moved
+
+- train on grayscale only

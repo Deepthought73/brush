@@ -1,6 +1,5 @@
-use crate::incremental_train_stream::view_sampling::{
-    RandomViewSampler, ViewSampler, create_view_sampler,
-};
+use crate::incremental_train_stream::landmark_householding::OccupancyGrid;
+use crate::incremental_train_stream::view_sampling::{ViewSampler, create_view_sampler};
 use crate::{
     RunningProcess,
     config::TrainStreamConfig,
@@ -10,41 +9,30 @@ use crate::{
 };
 use async_fn_stream::{TryStreamEmitter, try_fn_stream};
 use brush_dataset::scene::{SceneBatch, sample_to_packed_data, view_to_sample_image};
-use brush_render::shaders::SH_C0;
 use brush_render::{
     AlphaMode,
     camera::Camera,
     gaussian_splats::{SplatRenderMode, Splats},
 };
-use brush_serde::SplatData;
 use brush_train::eval::eval_stats;
-use brush_train::{
-    to_init_splats,
-    train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds},
-};
+use brush_train::train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds};
 use burn::{module::AutodiffModule, tensor::Tensor};
 use image::DynamicImage;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
-use crate::incremental_train_stream::landmark_householding::OccupancyGrid;
 
 pub mod config;
+mod landmark_householding;
 mod ui_interface;
 mod view_sampling;
-mod landmark_householding;
 
-pub struct FrameData {
+pub struct ReconstructionInput {
     pub poses: Vec<(i64, glam::Vec3, glam::Quat)>,
     pub landmarks_packed: Vec<f32>,
-    pub image: DynamicImage,
-    pub depth_data: Vec<u16>,
-    /// Packed row-major grayscale u8 pixels, size = width * height.
-    pub image_frame_id: i64,
+    pub images: Vec<(i64, DynamicImage, Vec<u16>)>,
 }
-
 
 pub struct ImageWithCamera {
     pub frame_id: i64,
@@ -301,7 +289,7 @@ pub struct NewTrainingData {
 }
 
 impl NewTrainingData {
-    pub fn build_from_frame_data(
+    pub fn build_from_reconstruction_input(
         poses_with_image: Vec<(i64, glam::Vec3, glam::Quat, DynamicImage, Vec<u16>)>,
         new_landmarks_packed: Vec<f32>,
         unit_camera: Camera,
