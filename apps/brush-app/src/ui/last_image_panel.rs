@@ -59,12 +59,9 @@ impl AppPane for LastImagePanel {
     }
 
     fn on_message(&mut self, message: &ProcessMessage, ui_process: &UiProcess) {
-        match message {
-            ProcessMessage::TrainMessage(TrainMessage::NewImage { image }) => {
-                self.image = Some(image.to_rgb8());
-                ui_process.repaint();
-            }
-            _ => {}
+        if let ProcessMessage::TrainMessage(TrainMessage::NewImage { image }) = message {
+            self.image = Some(image.to_rgb8());
+            ui_process.repaint();
         }
     }
 }

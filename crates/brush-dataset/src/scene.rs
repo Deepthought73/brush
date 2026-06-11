@@ -139,6 +139,15 @@ pub fn sample_to_packed_data(sample: DynamicImage) -> (TensorData, bool) {
     (TensorData::new(packed, [h as usize, w as usize]), has_alpha)
 }
 
+pub fn sample_to_packed_data_witout_copy(sample: &DynamicImage) -> (TensorData, bool) {
+    let _span = tracing::trace_span!("sample_to_packed").entered();
+    let (w, h) = (sample.width(), sample.height());
+    let has_alpha = sample.color().has_alpha();
+    let bytes = sample.as_bytes();
+    let packed: Vec<i32> = bytemuck::pod_collect_to_vec(bytes);
+    (TensorData::new(packed, [h as usize, w as usize]), has_alpha)
+}
+
 #[derive(Clone, Debug)]
 pub struct SceneBatch {
     /// `[H, W]` u32, each entry packs `[r g b a]` u8.

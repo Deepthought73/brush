@@ -1,9 +1,12 @@
-use crate::incremental_train_stream::{ImageWithCamera, IncrementalTrainContext, concat_splats};
+use crate::incremental_train_stream::{IncrementalTrainContext, concat_splats};
+use brush_render::camera::Camera;
 use brush_render::gaussian_splats::SplatRenderMode;
 use brush_render::shaders::SH_C0;
 use brush_serde::SplatData;
 use brush_train::to_init_splats;
+use image::DynamicImage;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 impl IncrementalTrainContext {
     async fn ensure_occupancy_grid_valid(&mut self) {
@@ -26,19 +29,24 @@ impl IncrementalTrainContext {
         }
     }
 
-    pub async fn add_new_landmarks_by_depth(&mut self, view: &ImageWithCamera) {
+    pub async fn add_new_landmarks_by_depth(
+        &mut self,
+        camera: Camera,
+        image: Arc<DynamicImage>,
+        depth: Arc<Vec<u16>>,
+    ) {
         let mut means = vec![];
         let mut sh_coeffs = vec![];
         let mut log_scales = vec![];
 
-        let w = view.image.width() as usize;
-        let h = view.image.height() as usize;
-        let img_size = glam::UVec2::new(view.image.width(), view.image.height());
+        let w = image.width() as usize;
+        let h = image.height() as usize;
+        let img_size = glam::UVec2::new(image.width(), image.height());
 
-        let raw_img = view.image.as_rgba8().unwrap().as_raw();
+        let raw_img = image.as_rgba8().unwrap().as_raw();
 
         let stride = 1;
-        let focal = view.camera.focal(img_size);
+        let focal = camera.focal(img_size);
 
         self.ensure_occupancy_grid_valid().await;
         let grid = self.occupancy_grid.as_mut().unwrap();
@@ -46,7 +54,7 @@ impl IncrementalTrainContext {
         for v in (0..h).step_by(stride) {
             for u in (0..w).step_by(stride) {
                 let idx = v * w + u;
-                let d = view.depth_data[idx];
+                let d = depth[idx];
                 if d == 0 {
                     continue;
                 }
@@ -57,8 +65,8 @@ impl IncrementalTrainContext {
 
                 let uv = glam::Vec2::new(u as f32 + 0.5, v as f32 + 0.5);
 
-                let pos_cam = view.camera.unproject(uv, d, img_size);
-                let pos_world = view.camera.transform(pos_cam);
+                let pos_cam = camera.unproject(uv, d, img_size);
+                let pos_world = camera.transform(pos_cam);
 
                 // Skip points too close to an existing/just-added gaussian.
                 // Inserting accepted points makes the new batch self-dedup too.
@@ -113,7 +121,7 @@ impl IncrementalTrainContext {
 
         self.splats = Some(match self.splats.take() {
             None => new_splat,
-            Some(existing) => concat_splats(existing, new_splat, render_mode),
+            Some(existing) => concat_splats(&existing, &new_splat, render_mode),
         });
     }
 }

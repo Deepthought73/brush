@@ -1,9 +1,11 @@
-use crate::incremental_train_stream::{ImageWithCamera, IncrementalTrainContext, NewTrainingData};
+use crate::incremental_train_stream::{FrameId, IncrementalTrainContext};
 use crate::message::{ProcessMessage, TrainMessage};
+use brush_dataset::Dataset;
 use brush_dataset::load_image::LoadImage;
 use brush_dataset::scene::SceneView;
-use brush_dataset::Dataset;
+use brush_render::camera::Camera;
 use brush_vfs::BrushVfs;
+use image::DynamicImage;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -44,11 +46,11 @@ impl IncrementalTrainContext {
             .await;
     }
 
-    pub fn update_up_axis(&mut self, new_data: &NewTrainingData) {
-        for train_view in new_data.views.iter() {
-            let rot = glam::Mat3::from_quat(train_view.camera.rotation);
+    pub fn update_up_axis(&mut self, new_cameras: impl Iterator<Item = Camera>) {
+        for camera in new_cameras {
+            let rot = glam::Mat3::from_quat(camera.rotation);
             if self.up_axis.is_none() {
-                self.up_axis = Some(rot.y_axis)
+                self.up_axis = Some(rot.y_axis);
             } else if let Some(up_axis) = self.up_axis.as_mut() {
                 *up_axis *= self.up_axis_factor_count;
                 *up_axis += rot.y_axis;
@@ -59,27 +61,12 @@ impl IncrementalTrainContext {
     }
 
     pub async fn update_ui_dataset(&self) {
-        let views = self
-            .training_views
-            .iter()
-            .map(|view| {
-                let img_path = PathBuf::from(&format!("{}.png", view.frame_id));
-                SceneView {
-                    image: LoadImage::new(
-                        Arc::new(BrushVfs::empty()),
-                        img_path,
-                        None,
-                        u32::MAX,
-                        None,
-                    ),
-                    camera: view.camera,
-                }
-            })
-            .collect();
+        let train_views = collect_scene_views(self.database.train_poses());
+        let eval_views = collect_scene_views(self.database.eval_poses());
 
         self.emitter
             .emit(ProcessMessage::TrainMessage(TrainMessage::Dataset {
-                dataset: Dataset::from_views(views, vec![]),
+                dataset: Dataset::from_views(train_views, eval_views),
             }))
             .await;
     }
@@ -88,8 +75,7 @@ impl IncrementalTrainContext {
         let (num_splats, sh) = self
             .splats
             .as_ref()
-            .map(|it| (it.num_splats(), it.sh_degree()))
-            .unwrap_or((0, 0));
+            .map_or((0, 0), |it| (it.num_splats(), it.sh_degree()));
         self.emitter
             .emit(ProcessMessage::SplatsUpdated {
                 up_axis: None,
@@ -107,14 +93,23 @@ impl IncrementalTrainContext {
             }))
             .await;
     }
-    
-    pub async fn update_last_images(&self, last_image: Option<&ImageWithCamera>) {
-        if let Some(last_image) = last_image {
-            self.emitter
-                .emit(ProcessMessage::TrainMessage(TrainMessage::NewImage {
-                    image: last_image.image.clone(),
-                }))
-                .await;
-        }
+
+    pub async fn update_last_images(&self, image: Arc<DynamicImage>) {
+        self.emitter
+            .emit(ProcessMessage::TrainMessage(TrainMessage::NewImage {
+                image,
+            }))
+            .await;
     }
+}
+
+fn collect_scene_views(iter: dashmap::iter::Iter<'_, FrameId, Camera>) -> Vec<SceneView> {
+    iter.map(|view| {
+        let img_path = PathBuf::from(&format!("{}.png", view.key()));
+        SceneView {
+            image: LoadImage::new(Arc::new(BrushVfs::empty()), img_path, None, u32::MAX, None),
+            camera: *view.value(),
+        }
+    })
+    .collect()
 }

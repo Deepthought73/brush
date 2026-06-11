@@ -274,8 +274,7 @@ impl SplatTrainer {
                 let log_median = log_scales.sum_dim(1) - log_max.clone() - log_min;
                 let ratio = (log_max - log_median).exp(); // max_scale / median_scale, >= 1
                 loss = loss
-                    + ratio.sub_scalar(1.0).clamp_min(0.0).mean()
-                        * self.config.scale_ratio_penalty;
+                    + ratio.sub_scalar(1.0).clamp_min(0.0).mean() * self.config.scale_ratio_penalty;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the

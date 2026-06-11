@@ -44,6 +44,8 @@ brush-train = { path = "../brush-train" }
 brush-dataset = { path = "../brush-dataset"}
 brush-rerun = { path = "../brush-rerun" }
 
+dashmap = "6.2.1"
+
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 

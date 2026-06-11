@@ -1132,6 +1132,7 @@ dependencies = [
  "burn-cubecl",
  "burn-wgpu",
  "clap",
+ "dashmap",
  "getrandom 0.4.2",
  "glam",
  "image",

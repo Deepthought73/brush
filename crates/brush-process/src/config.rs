@@ -1,6 +1,6 @@
+use crate::incremental_train_stream::config::IncrementalTrainConfig;
 use clap::{Args, Parser};
 use serde::{Deserialize, Serialize};
-use crate::incremental_train_stream::config::IncrementalTrainConfig;
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

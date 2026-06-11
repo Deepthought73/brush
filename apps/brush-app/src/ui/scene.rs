@@ -1119,10 +1119,10 @@ impl AppPane for ScenePanel {
                     grid.paint(rect, camera, model_ltw, grid_opacity, ui);
                 }
 
-                if settings.show_frustums {
-                    if let Some(frustums) = &self.camera_frustums {
-                        frustums.paint(rect, camera, ui, settings.frustum_scale.unwrap_or(0.15));
-                    }
+                if settings.show_frustums
+                    && let Some(frustums) = &self.camera_frustums
+                {
+                    frustums.paint(rect, camera, ui, settings.frustum_scale.unwrap_or(0.15));
                 }
             });
 
