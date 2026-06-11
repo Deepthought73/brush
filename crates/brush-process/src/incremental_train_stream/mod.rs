@@ -8,14 +8,10 @@ use crate::{
     wait_for_device,
 };
 use async_fn_stream::{TryStreamEmitter, try_fn_stream};
-use brush_render::{
-    AlphaMode,
-    camera::Camera,
-    gaussian_splats::{SplatRenderMode, Splats},
-};
+use brush_render::{AlphaMode, camera::Camera, gaussian_splats::Splats};
 use brush_train::eval::eval_stats;
 use brush_train::train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds};
-use burn::{module::AutodiffModule, tensor::Tensor};
+use burn::module::AutodiffModule;
 use image::DynamicImage;
 use std::sync::Arc;
 use std::time::Instant;
@@ -119,12 +115,7 @@ impl IncrementalTrainContext {
                     .add_gaussians_every_secs
             {
                 let unregistered_frames = self.database.get_unregistered_frames();
-
-                if unregistered_frames.is_empty() {
-                    self.refine().await;
-                } else {
-                    self.extend_gaussians(unregistered_frames).await;
-                }
+                self.extend_gaussians(unregistered_frames).await;
                 last_gaussian_added = Instant::now();
 
                 self.update_ui_dataset().await;
@@ -272,13 +263,4 @@ impl IncrementalTrainContext {
             ));
         }
     }
-}
-
-fn concat_splats(a: &Splats, b: &Splats, mode: SplatRenderMode) -> Splats {
-    let means = Tensor::cat(vec![a.means(), b.means()], 0);
-    let rotations = Tensor::cat(vec![a.rotations(), b.rotations()], 0);
-    let log_scales = Tensor::cat(vec![a.log_scales(), b.log_scales()], 0);
-    let sh_coeffs = Tensor::cat(vec![a.sh_coeffs.val(), b.sh_coeffs.val()], 0);
-    let opacities = Tensor::cat(vec![a.raw_opacities.val(), b.raw_opacities.val()], 0);
-    Splats::from_tensor_data(means, rotations, log_scales, sh_coeffs, opacities, mode)
 }

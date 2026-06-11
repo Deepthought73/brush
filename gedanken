@@ -14,5 +14,3 @@
 - look into memory allocations for images, when is what copied or moved
 
 - train on grayscale only
-
-- parallelize the occupancy grid

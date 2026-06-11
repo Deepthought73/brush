@@ -45,6 +45,7 @@ brush-dataset = { path = "../brush-dataset"}
 brush-rerun = { path = "../brush-rerun" }
 
 dashmap = "6.2.1"
+rayon.workspace = true
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
