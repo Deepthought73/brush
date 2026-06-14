@@ -1,7 +1,7 @@
 use crate::incremental_train_stream::IncrementalTrainContext;
 use brush_render::Splats;
 use brush_render::camera::Camera;
-use brush_render::gaussian_splats::SplatRenderMode;
+use brush_render::gaussian_splats::{SplatRenderMode, inverse_sigmoid};
 use brush_render::shaders::SH_C0;
 use brush_serde::SplatData;
 use brush_train::to_init_splats;
@@ -114,13 +114,14 @@ impl IncrementalTrainContext {
             .render_mode
             .unwrap_or(SplatRenderMode::Default);
 
+        let n_splats = means.len() / 3;
         let new_splat = to_init_splats(
             SplatData {
                 means,
                 rotations: None,
                 log_scales,
                 sh_coeffs,
-                raw_opacities: None,
+                raw_opacities: Some(vec![inverse_sigmoid(0.01); n_splats]),
             },
             render_mode,
             &self.device,

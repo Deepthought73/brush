@@ -14,3 +14,5 @@
 - look into memory allocations for images, when is what copied or moved
 
 - train on grayscale only
+
+- reorder gaussians spatially sometimes to improve cache performance

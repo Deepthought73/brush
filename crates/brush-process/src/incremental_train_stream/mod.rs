@@ -124,11 +124,16 @@ impl IncrementalTrainContext {
             if self.trainer.is_some() && self.splats.is_some() && !self.database.is_empty() {
                 self.train_step().await;
 
+                let decay_every = self.config.incremental_train_config.opacity_decay_every;
+                if decay_every > 0 && self.training_iteration.is_multiple_of(decay_every) {
+                    self.decay_opacity();
+                }
+
                 let refine_every = self.config.train_config.refine_every;
                 if self.training_iteration > 0
                     && self.training_iteration.is_multiple_of(refine_every)
                 {
-                    self.refine().await;
+                    self.prune_and_maybe_reset_opacity().await;
                 }
             }
 
@@ -169,24 +174,50 @@ impl IncrementalTrainContext {
             .set(0, self.splats.as_ref().unwrap().clone());
     }
 
-    async fn refine(&mut self) {
+    /// Soft opacity decay applied on its own cadence: nudges every gaussian's
+    /// opacity down so unneeded ones drift toward the prune threshold.
+    fn decay_opacity(&mut self) {
+        if self.splats.is_none() {
+            return;
+        }
+        let amount = self.config.incremental_train_config.opacity_decay_amount;
+        let current = self.splats.take().unwrap();
+        let new_splats = self.trainer.as_ref().unwrap().decay_opacity(current, amount);
+        self.splats = Some(new_splats);
+    }
+
+    /// Prune dead gaussians every refine, and hard-reset opacity on the
+    /// configured cadence so unneeded gaussians reveal themselves and get
+    /// pruned on a later pass.
+    async fn prune_and_maybe_reset_opacity(&mut self) {
         if self.splats.is_none() {
             return;
         }
 
+        let cfg = &self.config.incremental_train_config;
+        let reset_opacity = cfg.opacity_reset_every > 0
+            && self
+                .training_iteration
+                .is_multiple_of(cfg.opacity_reset_every);
+        let reset_value = cfg.opacity_reset_value;
+
         let current = self.splats.take().unwrap();
         let before_num = current.num_splats();
-        let (new_splats, refine_stats) = self
+        let (new_splats, pruned) = self
             .trainer
             .as_mut()
             .unwrap()
-            .refine(self.training_iteration, current)
+            .prune_and_reset_opacity(current, reset_opacity, reset_value)
             .await;
         let after_num = new_splats.num_splats();
-        log::info!("Refinement: {before_num} -> {after_num}");
+        if reset_opacity {
+            log::info!("Opacity reset + prune: {before_num} -> {after_num} ({pruned} pruned)");
+        } else {
+            log::info!("Prune: {before_num} -> {after_num} ({pruned} pruned)");
+        }
         self.emitter
             .emit(ProcessMessage::TrainMessage(TrainMessage::RefineStep {
-                cur_splat_count: refine_stats.total_splats,
+                cur_splat_count: after_num,
                 iter: self.training_iteration,
             }))
             .await;

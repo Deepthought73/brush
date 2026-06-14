@@ -31,4 +31,32 @@ pub struct IncrementalTrainConfig {
         default_value = "1.0"
     )]
     pub add_gaussians_every_secs: f64,
+
+    #[arg(
+        long,
+        help_heading = "How many training iterations between hard opacity resets (0 disables)",
+        default_value = "3000"
+    )]
+    pub opacity_reset_every: u32,
+
+    #[arg(
+        long,
+        help_heading = "Opacity value every gaussian is capped to on a hard reset",
+        default_value = "0.01"
+    )]
+    pub opacity_reset_value: f32,
+
+    #[arg(
+        long,
+        help_heading = "How many training iterations between soft opacity decays (0 disables)",
+        default_value = "200"
+    )]
+    pub opacity_decay_every: u32,
+
+    #[arg(
+        long,
+        help_heading = "Amount subtracted from each Gaussian's opacity on a soft decay",
+        default_value = "0.004"
+    )]
+    pub opacity_decay_amount: f32,
 }
