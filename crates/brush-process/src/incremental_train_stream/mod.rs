@@ -7,12 +7,14 @@ use crate::{
     slot::SlotSender,
     wait_for_device,
 };
+use anyhow::Context;
 use async_fn_stream::{TryStreamEmitter, try_fn_stream};
 use brush_render::{AlphaMode, camera::Camera, gaussian_splats::Splats};
 use brush_train::eval::eval_stats;
 use brush_train::train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds};
 use burn::module::AutodiffModule;
 use image::DynamicImage;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -27,7 +29,7 @@ pub type FrameId = u64;
 pub struct ImageData {
     pub frame_id: FrameId,
     pub image: DynamicImage,
-    pub depth: Vec<u16>,
+    pub depth: Vec<f32>,
 }
 
 pub struct PoseData {
@@ -59,7 +61,8 @@ pub struct IncrementalTrainContext {
 
     trainer: Option<SplatTrainer>,
     training_iteration: u32,
-    training_start: Instant,
+    training_start: Option<Instant>,
+    next_export_second: f64,
     splats: Option<Splats>,
     config: TrainStreamConfig,
 
@@ -91,7 +94,8 @@ impl IncrementalTrainContext {
             splats: None,
             trainer: None,
             training_iteration: 0,
-            training_start: Instant::now(),
+            training_start: None,
+            next_export_second: config.process_config.export_every as f64,
             emitter,
             config,
             occupancy_grid: None,
@@ -137,16 +141,28 @@ impl IncrementalTrainContext {
                 }
             }
 
-            if self.training_iteration.is_multiple_of(100) {
-                self.update_train_status_ui().await;
-                self.update_splat_in_ui().await;
+            if self.training_iteration > 0 {
+                if self.training_iteration.is_multiple_of(100) {
+                    self.update_train_status_ui().await;
+                    self.update_splat_in_ui().await;
+                }
+
+                if self
+                    .training_iteration
+                    .is_multiple_of(self.config.process_config.eval_every)
+                {
+                    self.eval_step().await?;
+                }
             }
 
-            if self
-                .training_iteration
-                .is_multiple_of(self.config.process_config.eval_every)
-            {
-                self.eval_step().await?;
+            if let Some(training_start) = self.training_start {
+                let training_time = training_start.elapsed().as_secs_f64();
+                if training_time > self.next_export_second {
+                    self.next_export_second += self.config.process_config.export_every as f64;
+                    let start = Instant::now();
+                    self.export_checkpoint().await?;
+                    log::info!("Export took: {:?}", start.elapsed());
+                }
             }
 
             brush_async::yield_now().await;
@@ -154,6 +170,10 @@ impl IncrementalTrainContext {
     }
 
     async fn train_step(&mut self) {
+        if self.training_iteration == 0 {
+            self.training_start = Some(Instant::now());
+        }
+
         self.training_iteration += 1;
         self.occupancy_grid = None;
 
@@ -182,7 +202,11 @@ impl IncrementalTrainContext {
         }
         let amount = self.config.incremental_train_config.opacity_decay_amount;
         let current = self.splats.take().unwrap();
-        let new_splats = self.trainer.as_ref().unwrap().decay_opacity(current, amount);
+        let new_splats = self
+            .trainer
+            .as_ref()
+            .unwrap()
+            .decay_opacity(current, amount);
         self.splats = Some(new_splats);
     }
 
@@ -229,6 +253,11 @@ impl IncrementalTrainContext {
             let mut psnr_sum = 0.;
             let mut ssim_sum = 0.;
             let eval_views = self.database.eval_views();
+
+            if eval_views.is_empty() {
+                return Ok(());
+            }
+
             for (_, camera, image) in &eval_views {
                 let eval_result = eval_stats(
                     splats.clone(),
@@ -254,7 +283,7 @@ impl IncrementalTrainContext {
 
             log::info!(
                 "Train time: {:.2}, ITER: {}, PSNR: {}, SSIM: {}",
-                self.training_start.elapsed().as_secs_f64(),
+                self.training_start.unwrap().elapsed().as_secs_f64(),
                 self.training_iteration,
                 psnr,
                 ssim
@@ -264,7 +293,7 @@ impl IncrementalTrainContext {
         Ok(())
     }
 
-    async fn extend_gaussians(&mut self, frames: Vec<(Camera, Arc<DynamicImage>, Arc<Vec<u16>>)>) {
+    async fn extend_gaussians(&mut self, frames: Vec<(Camera, Arc<DynamicImage>, Arc<Vec<f32>>)>) {
         if frames.is_empty() {
             return;
         }
@@ -293,5 +322,24 @@ impl IncrementalTrainContext {
                 bounds,
             ));
         }
+    }
+
+    async fn export_checkpoint(&self) -> Result<(), anyhow::Error> {
+        if let Some(splats) = self.splats.clone() {
+            let export_path = PathBuf::from(&self.config.process_config.export_path);
+            tokio::fs::create_dir_all(&export_path)
+                .await
+                .with_context(|| format!("Creating export directory {}", export_path.display()))?;
+            let splat_data = brush_serde::splat_to_ply(splats)
+                .await
+                .context("Serializing splat data")?;
+            tokio::fs::write(
+                export_path.join(format!("{}.ply", self.training_iteration)),
+                splat_data,
+            )
+            .await
+            .context(format!("Failed to export ply {export_path:?}"))?;
+        }
+        Ok(())
     }
 }

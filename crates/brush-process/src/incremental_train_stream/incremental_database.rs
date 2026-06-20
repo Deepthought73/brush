@@ -17,7 +17,7 @@ struct Inner {
     train_poses: Arc<DashMap<FrameId, Camera>>,
     eval_poses: Arc<DashMap<FrameId, Camera>>,
     image_data: Arc<DashMap<FrameId, Arc<DynamicImage>>>,
-    depth_data: Arc<DashMap<FrameId, Arc<Vec<u16>>>>,
+    depth_data: Arc<DashMap<FrameId, Arc<Vec<f32>>>>,
     total_poses: Arc<AtomicUsize>,
     unregistered_frame_ids: Arc<RwLock<Arc<DashSet<FrameId>>>>,
 }
@@ -80,32 +80,45 @@ impl IncrementalDatabase {
     }
 
     pub fn eval_views(&self) -> Vec<(FrameId, Camera, Arc<DynamicImage>)> {
-        let mut ret = vec![];
-        for it in self.inner.eval_poses.iter() {
-            let image = self.inner.image_data.get(it.key()).unwrap().clone();
-            ret.push((*it.key(), *it.value(), image));
-        }
-        ret
+        self.inner
+            .eval_poses
+            .iter()
+            .filter_map(|it| {
+                if let Some(image) = self.inner.image_data.get(it.key()) {
+                    Some((*it.key(), *it.value(), image.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn total_view_count(&self) -> usize {
         self.inner.total_poses.load(Ordering::Relaxed)
     }
 
-    pub fn get_unregistered_frames(&mut self) -> Vec<(Camera, Arc<DynamicImage>, Arc<Vec<u16>>)> {
+    pub fn get_unregistered_frames(&mut self) -> Vec<(Camera, Arc<DynamicImage>, Arc<Vec<f32>>)> {
         let unregistered_frame_ids = {
             let mut guard = self.inner.unregistered_frame_ids.write().unwrap();
             mem::take(&mut *guard)
         };
 
+        let guard = self.inner.unregistered_frame_ids.read().unwrap();
         unregistered_frame_ids
             .iter()
-            .map(|frame_id| {
-                let camera = *self.inner.train_poses.get(&*frame_id).unwrap();
-                let image = self.inner.image_data.get(&*frame_id).unwrap().clone();
-                let depth = self.inner.depth_data.get(&*frame_id).unwrap().clone();
-                self.view_sampler.added_new_item(*frame_id);
-                (camera, image, depth)
+            .filter_map(|frame_id| {
+                let frame_id = *frame_id;
+
+                if let Some(image) = self.inner.image_data.get(&frame_id)
+                    && let Some(depth) = self.inner.depth_data.get(&frame_id)
+                {
+                    let camera = *self.inner.train_poses.get(&frame_id).unwrap();
+                    self.view_sampler.added_new_item(frame_id);
+                    Some((camera, image.clone(), depth.clone()))
+                } else {
+                    guard.insert(frame_id);
+                    None
+                }
             })
             .collect()
     }
@@ -132,7 +145,6 @@ fn spawn_pose_receiver(
     let Inner {
         train_poses,
         eval_poses,
-        image_data,
         total_poses,
         unregistered_frame_ids,
         ..
@@ -142,11 +154,6 @@ fn spawn_pose_receiver(
 
     thread::spawn(move || {
         while let Ok(data) = pose_receiver.recv() {
-            if !image_data.contains_key(&data.frame_id) {
-                log::warn!("Ignoring pose at {} because no image exists", data.frame_id);
-                continue;
-            }
-
             let mut camera = unit_camera;
             camera.position = data.translation;
             camera.rotation = data.quat;

@@ -88,7 +88,7 @@ impl IncrementalTrainContext {
         self.emitter
             .emit(ProcessMessage::TrainMessage(TrainMessage::TrainStep {
                 iter: self.training_iteration,
-                total_elapsed: self.training_start.elapsed(),
+                total_elapsed: self.training_start.unwrap().elapsed(),
                 lod_progress: None,
             }))
             .await;

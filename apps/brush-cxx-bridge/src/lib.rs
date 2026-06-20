@@ -35,7 +35,7 @@ mod ffi {
             img_height: u32,
             mask_path: &str,
         ) -> Box<BrushBridge>;
-        unsafe fn send_image(&self, frame_id: u64, image_ptr: *const u16, depth_ptr: *const u16);
+        unsafe fn send_image(&self, frame_id: u64, image_ptr: *const u16, depth_ptr: *const f32);
         fn new_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]);
         fn update_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]);
         fn run_ui(&mut self) -> Result<()>;
@@ -117,7 +117,7 @@ fn create_brush_bridge(
 }
 
 impl BrushBridge {
-    unsafe fn send_image(&self, frame_id: u64, image_ptr: *const u16, depth_ptr: *const u16) {
+    unsafe fn send_image(&self, frame_id: u64, image_ptr: *const u16, depth_ptr: *const f32) {
         let pixel_count = (self.img_width * self.img_height) as usize;
         let mut rgba_bytes = Vec::with_capacity(pixel_count * 4);
 

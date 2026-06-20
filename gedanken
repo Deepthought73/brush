@@ -1,18 +1,21 @@
 - loop closure working: update gaussians hosted by keyframes after the keyframes got updated by loop closure
 
-- training convergence:
-    - better densification
+- densification ideas:
+    - pruning by opacity
+    - start with low opacity
 
 - optimize poses while training GS
-
-- add depth loss
-
-- add gaussians only in empty areas
-
-- remove densification
 
 - look into memory allocations for images, when is what copied or moved
 
 - train on grayscale only
 
 - reorder gaussians spatially sometimes to improve cache performance
+
+- depth related:
+    - depth loss
+    - improve depth smoothing/filtering
+    - use landmarks to improve depth
+    - look into possible memory leak of foundation stereo
+
+- regulate number of keyframes that are used for GS training -> reduce required depth maps/s

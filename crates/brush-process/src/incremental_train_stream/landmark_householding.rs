@@ -37,7 +37,7 @@ impl IncrementalTrainContext {
         &mut self,
         camera: Camera,
         image: Arc<DynamicImage>,
-        depth: Arc<Vec<u16>>,
+        depth: Arc<Vec<f32>>,
     ) {
         let mut means = vec![];
         let mut sh_coeffs = vec![];
@@ -62,13 +62,9 @@ impl IncrementalTrainContext {
             .into_par_iter()
             .filter_map(|idx| {
                 let d = depth[idx];
-                if d == 0 {
+                if d <= 0.01 {
                     return None;
                 }
-
-                // TODO depth is in mm, maybe preprocess somewhere else, if the unit changes
-                // TODO or: provide unit of depth in config
-                let d = d as f32 / 1000.;
 
                 let u = idx % w;
                 let v = idx / w;
@@ -121,7 +117,12 @@ impl IncrementalTrainContext {
                 rotations: None,
                 log_scales,
                 sh_coeffs,
-                raw_opacities: Some(vec![inverse_sigmoid(0.01); n_splats]),
+                raw_opacities: Some(vec![
+                    inverse_sigmoid(
+                        self.config.incremental_train_config.initial_opacity
+                    );
+                    n_splats
+                ]),
             },
             render_mode,
             &self.device,

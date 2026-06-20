@@ -59,4 +59,11 @@ pub struct IncrementalTrainConfig {
         default_value = "0.004"
     )]
     pub opacity_decay_amount: f32,
+
+    #[arg(
+        long,
+        help_heading = "Opacity given to Gaussians on initialization",
+        default_value = "0.01"
+    )]
+    pub initial_opacity: f32,
 }

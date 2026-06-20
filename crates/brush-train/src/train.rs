@@ -683,11 +683,7 @@ impl SplatTrainer {
 
         // Dead (below MIN_OPACITY) or non-finite opacity → prune.
         let alpha_mask = splats.opacities().lower_elem(MIN_OPACITY);
-        let opac_bad = splats
-            .raw_opacities
-            .val()
-            .is_finite()
-            .bool_not();
+        let opac_bad = splats.raw_opacities.val().is_finite().bool_not();
         let prune_mask = alpha_mask.bool_or(opac_bad);
 
         let (mut splats, refiner, pruned_count) =
