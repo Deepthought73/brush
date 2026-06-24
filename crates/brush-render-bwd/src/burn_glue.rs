@@ -53,20 +53,21 @@ pub struct SplatGrads<B: Backend> {
 }
 
 /// Backward pass trait mirroring [`SplatOps`].
-pub trait SplatBwdOps<B: Backend>: SplatOps<B> {
+pub trait SplatBwdOps: SplatOps {
     /// Backward pass for rasterization.
     /// Returns sparse `v_combined` [`num_visible`, 10] indexed by `compact_gid`.
     #[allow(clippy::too_many_arguments)]
     fn rasterize_bwd(
-        out_img: FloatTensor<B>,
-        projected_splats: FloatTensor<B>,
-        compact_gid_from_isect: IntTensor<B>,
-        tile_offsets: IntTensor<B>,
+        out_img: FloatTensor<Self>,
+        projected_splats: FloatTensor<Self>,
+        compact_gid_from_isect: IntTensor<Self>,
+        tile_offsets: IntTensor<Self>,
         background: Vec3,
         img_size: glam::UVec2,
-        v_output: FloatTensor<B>,
+        v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
-    ) -> RasterizeGrads<B>;
+        render_depth: bool,
+    ) -> RasterizeGrads<Self>;
 
     /// Backward pass for projection.
     /// Reads sparse `v_combined` [`num_visible`, 9], writes dense outputs (scatter in kernel).
@@ -75,15 +76,14 @@ pub trait SplatBwdOps<B: Backend>: SplatOps<B> {
     /// view direction and then to the mean.
     #[allow(clippy::too_many_arguments)]
     fn project_bwd(
-        transforms: FloatTensor<B>,
-        sh_coeffs: FloatTensor<B>,
-        raw_opac: FloatTensor<B>,
-        global_from_compact_gid: IntTensor<B>,
+        transforms: FloatTensor<Self>,
+        sh_coeffs: FloatTensor<Self>,
+        raw_opac: FloatTensor<Self>,
+        global_from_compact_gid: IntTensor<Self>,
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
-        v_combined: FloatTensor<B>,
-        screen_area_penalty: f32,
-    ) -> SplatGrads<B>;
+        v_combined: FloatTensor<Self>,
+    ) -> SplatGrads<Self>;
 }
 
 /// State saved during forward pass for backward computation.
@@ -103,9 +103,9 @@ struct GaussianBackwardState<B: Backend> {
 
     render_mode: SplatRenderMode,
     pass: brush_render::gaussian_splats::RasterPass,
+    rasterization_mode: brush_render::gaussian_splats::RasterizationMode,
     background: Vec3,
     img_size: glam::UVec2,
-    screen_area_penalty: f32,
 }
 
 #[derive(Debug)]
@@ -114,7 +114,7 @@ struct RenderBackwards;
 const NUM_BWD_ARGS: usize = 4;
 
 // Implement gradient registration when rendering backwards.
-impl<B: Backend + SplatBwdOps<B>> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
+impl<B: Backend + SplatBwdOps> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
     type State = GaussianBackwardState<B>;
 
     fn backward(
@@ -146,6 +146,7 @@ impl<B: Backend + SplatBwdOps<B>> Backward<B, NUM_BWD_ARGS> for RenderBackwards 
             state.img_size,
             v_output,
             state.pass.smooth_cutoff(),
+            state.rasterization_mode.render_depth(),
         );
 
         let splat_grads = B::project_bwd(
@@ -156,7 +157,6 @@ impl<B: Backend + SplatBwdOps<B>> Backward<B, NUM_BWD_ARGS> for RenderBackwards 
             state.project_uniforms,
             state.render_mode,
             rasterize_grads.v_combined,
-            state.screen_area_penalty,
         );
 
         if let Some(node) = transforms_parent {
@@ -222,7 +222,6 @@ pub async fn render_splats(
     camera: &Camera,
     img_size: glam::UVec2,
     background: Vec3,
-    screen_area_penalty: f32,
 ) -> SplatOutputDiff {
     render_splats_with_pass(
         splats,
@@ -230,7 +229,7 @@ pub async fn render_splats(
         img_size,
         background,
         brush_render::gaussian_splats::RasterPass::Backward,
-        screen_area_penalty,
+        brush_render::gaussian_splats::RasterizationMode::Rgba,
     )
     .await
 }
@@ -245,7 +244,7 @@ pub async fn render_splats_with_pass(
     img_size: glam::UVec2,
     background: Vec3,
     pass: brush_render::gaussian_splats::RasterPass,
-    screen_area_penalty: f32,
+    rasterization_mode: brush_render::gaussian_splats::RasterizationMode,
 ) -> SplatOutputDiff {
     splats.clone().validate_values().await;
 
@@ -298,13 +297,14 @@ pub async fn render_splats_with_pass(
         pass.bwd_info(),
         "render_splats_with_pass requires a Backward variant"
     );
-    let output = <MainBackend as SplatOps<MainBackend>>::render(
+    let output = <MainBackend as SplatOps>::render(
         camera,
         img_size,
         transforms_inner.clone(),
         sh_inner.clone(),
         raw_opac_inner.clone(),
         render_mode,
+        rasterization_mode,
         background,
         pass,
     )
@@ -329,10 +329,10 @@ pub async fn render_splats_with_pass(
                 compact_gid_from_isect: output.compact_gid_from_isect,
                 render_mode,
                 pass,
+                rasterization_mode,
                 global_from_compact_gid: output.global_from_compact_gid,
                 background,
                 img_size,
-                screen_area_penalty,
             };
             prep.finish(state, output.out_img)
         }
@@ -351,7 +351,7 @@ pub async fn render_splats_with_pass(
     }
 }
 
-impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
+impl SplatBwdOps for Fusion<MainBackendBase> {
     #[allow(clippy::too_many_arguments)]
     fn rasterize_bwd(
         out_img: FloatTensor<Self>,
@@ -362,6 +362,7 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
+        render_depth: bool,
     ) -> RasterizeGrads<Self> {
         #[derive(Debug)]
         struct CustomOp {
@@ -369,6 +370,7 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
             background: Vec3,
             img_size: glam::UVec2,
             smooth_cutoff: bool,
+            render_depth: bool,
         }
 
         impl Operation<FusionCubeRuntime<WgpuRuntime>> for CustomOp {
@@ -388,7 +390,7 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
 
                 let [v_combined] = outputs;
 
-                let grads = <MainBackendBase as SplatBwdOps<MainBackendBase>>::rasterize_bwd(
+                let grads = <MainBackendBase as SplatBwdOps>::rasterize_bwd(
                     h.get_float_tensor::<MainBackendBase>(out_img),
                     h.get_float_tensor::<MainBackendBase>(projected_splats),
                     h.get_int_tensor::<MainBackendBase>(compact_gid_from_isect),
@@ -397,6 +399,7 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
                     self.img_size,
                     h.get_float_tensor::<MainBackendBase>(v_output),
                     self.smooth_cutoff,
+                    self.render_depth,
                 );
 
                 h.register_float_tensor::<MainBackendBase>(&v_combined.id, grads.v_combined);
@@ -420,7 +423,7 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
         let outputs = {
             let v_combined_out = TensorIr::uninit(
                 client.create_empty_handle(),
-                Shape::new([num_visible, 10]),
+                Shape::new([num_visible, 11]),
                 DType::F32,
             );
             let stream = StreamId::current();
@@ -434,6 +437,7 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
                 background,
                 img_size,
                 smooth_cutoff,
+                render_depth,
             };
             client
                 .register(stream, OperationIr::Custom(desc), op)
@@ -454,13 +458,9 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
-        screen_area_penalty: f32,
     ) -> SplatGrads<Self> {
         // The screen-area regulariser only acts in the backward kernel, so we
         // stamp the weight onto the uniforms here rather than in the forward.
-        let mut project_uniforms = project_uniforms;
-        project_uniforms.screen_area_penalty = screen_area_penalty;
-
         #[derive(Debug)]
         struct CustomOp {
             desc: CustomOpIr,
@@ -485,7 +485,7 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
 
                 let [v_transforms, v_coeffs, v_raw_opac, v_refine_weight] = outputs;
 
-                let grads = <MainBackendBase as SplatBwdOps<MainBackendBase>>::project_bwd(
+                let grads = <MainBackendBase as SplatBwdOps>::project_bwd(
                     h.get_float_tensor::<MainBackendBase>(transforms),
                     h.get_float_tensor::<MainBackendBase>(sh_coeffs),
                     h.get_float_tensor::<MainBackendBase>(raw_opac),
@@ -493,8 +493,6 @@ impl SplatBwdOps<Self> for Fusion<MainBackendBase> {
                     self.project_uniforms,
                     self.render_mode,
                     h.get_float_tensor::<MainBackendBase>(v_combined_in),
-                    // Already stamped onto the uniforms by the outer project_bwd.
-                    self.project_uniforms.screen_area_penalty,
                 );
 
                 h.register_float_tensor::<MainBackendBase>(&v_transforms.id, grads.v_transforms);

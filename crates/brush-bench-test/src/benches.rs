@@ -136,6 +136,7 @@ fn generate_training_batch(resolution: (u32, u32), camera_pos: Vec3) -> SceneBat
         img_packed,
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
+        depth: None,
         camera,
     }
 }
@@ -188,7 +189,6 @@ pub async fn run_backward_render(
             &camera,
             glam::uvec2(resolution.0, resolution.1),
             Vec3::ZERO,
-            0.0,
         )
         .await;
         let _ = diff_out.img.mean().backward();

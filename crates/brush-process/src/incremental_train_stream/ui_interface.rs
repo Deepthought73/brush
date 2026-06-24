@@ -109,6 +109,7 @@ fn collect_scene_views(iter: dashmap::iter::Iter<'_, FrameId, Camera>) -> Vec<Sc
         SceneView {
             image: LoadImage::new(Arc::new(BrushVfs::empty()), img_path, None, u32::MAX, None),
             camera: *view.value(),
+            depth: None,
         }
     })
     .collect()

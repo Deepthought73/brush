@@ -18,7 +18,7 @@ use crate::burn_glue::{RasterizeGrads, SplatBwdOps, SplatGrads};
 use crate::kernels;
 use brush_render::shaders::helpers::ProjectUniforms;
 
-impl SplatBwdOps<Self> for MainBackendBase {
+impl SplatBwdOps for MainBackendBase {
     fn rasterize_bwd(
         out_img: FloatTensor<Self>,
         projected_splats: FloatTensor<Self>,
@@ -28,6 +28,7 @@ impl SplatBwdOps<Self> for MainBackendBase {
         img_size: glam::UVec2,
         v_output: FloatTensor<Self>,
         smooth_cutoff: bool,
+        render_depth: bool,
     ) -> RasterizeGrads<Self> {
         let _span = tracing::trace_span!("rasterize_bwd").entered();
 
@@ -36,8 +37,9 @@ impl SplatBwdOps<Self> for MainBackendBase {
         let num_visible = projected_splats.shape()[0].max(1);
         let client = projected_splats.client.clone();
 
-        // Sparse [num_visible, 10] indexed by compact_gid.
-        let v_combined = Self::float_zeros([num_visible, 10].into(), &device, FloatDType::F32);
+        // Sparse [num_visible, 11] indexed by compact_gid. Lane 10 is the
+        // expected-depth gradient (zero in colour-only modes).
+        let v_combined = Self::float_zeros([num_visible, 11].into(), &device, FloatDType::F32);
 
         let tile_bounds = uvec2(
             img_size
@@ -81,6 +83,7 @@ impl SplatBwdOps<Self> for MainBackendBase {
                     v_combined.clone().into_tensor_arg(),
                     uniforms,
                     smooth_cutoff,
+                    render_depth,
                 );
             } else {
                 rasterize_backwards_kernel::launch::<CasAtomicAdd, WgpuRuntime>(
@@ -95,6 +98,7 @@ impl SplatBwdOps<Self> for MainBackendBase {
                     v_combined.clone().into_tensor_arg(),
                     uniforms,
                     smooth_cutoff,
+                    render_depth,
                 );
             }
         });
@@ -111,15 +115,11 @@ impl SplatBwdOps<Self> for MainBackendBase {
         project_uniforms: ProjectUniforms,
         render_mode: SplatRenderMode,
         v_combined: FloatTensor<Self>,
-        screen_area_penalty: f32,
     ) -> SplatGrads<Self> {
         let _span = tracing::trace_span!("project_bwd").entered();
 
         // The screen-area regulariser only acts in this backward kernel, so we
         // stamp the weight onto the uniforms here rather than in the forward.
-        let mut project_uniforms = project_uniforms;
-        project_uniforms.screen_area_penalty = screen_area_penalty;
-
         let transforms = into_contiguous(transforms);
         let sh_coeffs = into_contiguous(sh_coeffs);
         let raw_opac = into_contiguous(raw_opac);

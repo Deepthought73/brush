@@ -1,6 +1,6 @@
-use brush_cube::MainBackend;
 use burn::{
     Tensor,
+    backend::Dispatch,
     module::{Module, Param, ParamId},
     tensor::{Device, Gradients, TensorData, activation::sigmoid, s},
 };
@@ -10,7 +10,6 @@ use tracing::trace_span;
 
 use crate::{
     RenderAux, SplatOps,
-    burn_glue::{unwrap_wgpu_float, wrap_wgpu_float, wrap_wgpu_int},
     camera::Camera,
     sh::{sh_coeffs_for_degree, sh_degree_from_coeffs},
 };
@@ -20,6 +19,24 @@ use crate::{
 pub enum SplatRenderMode {
     Default,
     Mip,
+}
+
+/// Output channels the rasterizer produces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum RasterizationMode {
+    #[default]
+    Rgba,
+    RgbaAndDepth,
+}
+
+impl RasterizationMode {
+    pub const fn render_depth(self) -> bool {
+        matches!(self, Self::RgbaAndDepth)
+    }
+
+    pub const fn bwd_out_channels(self) -> usize {
+        if self.render_depth() { 5 } else { 4 }
+    }
 }
 
 /// Forward/backward rasterizer mode. Replaces the old `bwd_info: bool` so the
@@ -371,6 +388,46 @@ pub async fn render_splats(
     splat_scale: Option<f32>,
     texture_mode: TextureMode,
 ) -> (Tensor<3>, RenderAux) {
+    render_splats_inner(
+        splats,
+        camera,
+        img_size,
+        background,
+        splat_scale,
+        texture_mode,
+        RasterizationMode::Rgba,
+    )
+    .await
+}
+
+pub async fn render_splats_depth(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    splat_scale: Option<f32>,
+) -> (Tensor<3>, RenderAux) {
+    render_splats_inner(
+        splats,
+        camera,
+        img_size,
+        background,
+        splat_scale,
+        TextureMode::Float,
+        RasterizationMode::RgbaAndDepth,
+    )
+    .await
+}
+
+async fn render_splats_inner(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    splat_scale: Option<f32>,
+    texture_mode: TextureMode,
+    raster_mode: RasterizationMode,
+) -> (Tensor<3>, RenderAux) {
     splats.clone().validate_values().await;
 
     let sh_coeffs = splats.sh_coeffs.into_value();
@@ -401,10 +458,6 @@ pub async fn render_splats(
 
     let use_float = matches!(texture_mode, TextureMode::Float);
 
-    let transforms_p = unwrap_wgpu_float(transforms);
-    let sh_coeffs_p = unwrap_wgpu_float(sh_coeffs);
-    let raw_opacities_p = unwrap_wgpu_float(raw_opacities);
-
     // Float mode needs `Backward` (f32 image + per-splat bookkeeping); Packed
     // mode goes through the packed u8 path. Neither inference path uses the
     // smooth cutoff — that's reserved for the gradient-check tests.
@@ -413,13 +466,17 @@ pub async fn render_splats(
     } else {
         RasterPass::Forward
     };
-    let output = <MainBackend as SplatOps<MainBackend>>::render(
+    // Route through the `#[backend_extension]`-generated `Dispatch` impl: it
+    // unwraps these dispatch primitives to the Wgpu backend, runs the render,
+    // and re-wraps the `RenderOutput` via its `ExtensionType` derive.
+    let output = <Dispatch as SplatOps>::render(
         camera,
         img_size,
-        transforms_p,
-        sh_coeffs_p,
-        raw_opacities_p,
+        transforms.into_dispatch(),
+        sh_coeffs.into_dispatch(),
+        raw_opacities.into_dispatch(),
         render_mode,
+        raster_mode,
         background,
         pass,
     )
@@ -434,11 +491,11 @@ pub async fn render_splats(
     let aux = RenderAux {
         num_visible,
         num_intersections,
-        visible: wrap_wgpu_float(output.aux.visible),
-        max_radius: wrap_wgpu_float(output.aux.max_radius),
-        tile_offsets: wrap_wgpu_int(output.aux.tile_offsets),
+        visible: Tensor::from_dispatch(output.aux.visible),
+        max_radius: Tensor::from_dispatch(output.aux.max_radius),
+        tile_offsets: Tensor::from_dispatch(output.aux.tile_offsets),
         img_size,
     };
 
-    (wrap_wgpu_float(output.out_img), aux)
+    (Tensor::from_dispatch(output.out_img), aux)
 }

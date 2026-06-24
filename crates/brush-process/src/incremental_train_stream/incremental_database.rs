@@ -68,6 +68,7 @@ impl IncrementalDatabase {
             has_alpha,
             alpha_mode: AlphaMode::Masked,
             camera,
+            depth: todo!()
         }
     }
 

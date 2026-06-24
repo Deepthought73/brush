@@ -324,6 +324,7 @@ pub(crate) async fn train_stream(
         } else {
             RefineStats {
                 num_added: 0,
+                num_split_oversized: 0,
                 num_split_high_grad: 0,
                 num_pruned: 0,
                 num_pruned_non_finite: 0,
@@ -416,10 +417,18 @@ pub(crate) async fn train_stream(
                     .unwrap();
             }
 
-            visualize.log_memory(
-                iter,
-                &WgpuRuntime::<AutoCompiler>::client(wgpu_device).memory_usage_total()?,
-            )?;
+            // The memory query goes through the compute server and stalls
+            // behind all queued GPU work — keep it off the hot path unless
+            // rerun is actually recording, and then only on the stats cadence.
+            if rerun_config.rerun_enabled
+                && (iter.is_multiple_of(rerun_config.rerun_log_train_stats_every) || is_last_step)
+            {
+                visualize.log_memory(
+                    iter,
+                    &WgpuRuntime::<AutoCompiler>::client(wgpu_device).memory_usage()?,
+                )?;
+            }
+
             if refine.num_added > 0 {
                 visualize
                     .log_refine_stats(iter, &refine, refine_dur)

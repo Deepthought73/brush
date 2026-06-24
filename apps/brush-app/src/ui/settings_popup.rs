@@ -156,9 +156,9 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
         );
         slider(
             ui,
-            &mut tc.kill_at_screen_size,
+            &mut tc.split_at_screen_size,
             0.0..=1.0,
-            "Kill at screen size (0 disables)",
+            "Split at screen size (0 disables)",
             false,
             enabled,
         );
@@ -187,6 +187,14 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             &mut tc.match_alpha_weight,
             0.01..=1.0,
             "Alpha match weight",
+            false,
+            enabled,
+        );
+        slider(
+            ui,
+            &mut tc.depth_loss_weight,
+            0.0..=1.0,
+            "Depth loss weight (0 disables)",
             false,
             enabled,
         );
@@ -395,6 +403,14 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             args.load_config.alpha_mode = Some(alpha_mode);
         }
     }
+
+    ui.add_enabled(
+        enabled,
+        egui::Checkbox::new(
+            &mut args.load_config.estimate_metric_scale,
+            "Estimate metric scale",
+        ),
+    );
 
     ui.add_space(16.0);
 

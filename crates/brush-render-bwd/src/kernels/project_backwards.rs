@@ -124,7 +124,7 @@ pub fn project_backwards_kernel(
     // splats that contributed to a pixel; non-contributing splats leave
     // v_rasterize_grads at zero and (since the dense outputs are zero-
     // init) we can return without writing anything at all.
-    let rg_base = (compact_gid * 10u32) as usize;
+    let rg_base = (compact_gid * 11u32) as usize;
     let v_mean2d_x = v_rasterize_grads[rg_base];
     let v_mean2d_y = v_rasterize_grads[rg_base + 1];
     let v_conics_x = v_rasterize_grads[rg_base + 2];
@@ -135,6 +135,7 @@ pub fn project_backwards_kernel(
     let v_color_b = v_rasterize_grads[rg_base + 7];
     let v_alpha_in = v_rasterize_grads[rg_base + 8];
     let v_refine_in = v_rasterize_grads[rg_base + 9];
+    let v_depth_in = v_rasterize_grads[rg_base + 10];
 
     let any_grad = v_mean2d_x != 0.0f32
         || v_mean2d_y != 0.0f32
@@ -145,7 +146,8 @@ pub fn project_backwards_kernel(
         || v_color_g != 0.0f32
         || v_color_b != 0.0f32
         || v_alpha_in != 0.0f32
-        || v_refine_in != 0.0f32;
+        || v_refine_in != 0.0f32
+        || v_depth_in != 0.0f32;
     if !any_grad {
         terminate!();
     }
@@ -193,29 +195,7 @@ pub fn project_backwards_kernel(
         c01: v_conics_y * 0.5f32,
         c11: v_conics_z,
     };
-    let v_cov2d_image = inverse2x2_vjp(conic_inv, v_inv);
-
-    // Differentiable per-splat screen-area regulariser. The 1σ ellipse area
-    // as a fraction of the image is `area_frac = π·sqrt(det(cov)) / (W·H)`, and
-    // the loss contribution is `weight · area_frac² / num_visible`. The gradient
-    // flows analytically into v_cov2d through `d(sqrt(det))/d(cov.*)`. With
-    // weight=0 the contribution is 0 (branch-free).
-    let det = cov.c00 * cov.c11 - cov.c01 * cov.c01;
-    let sqrt_det = f32::sqrt(f32::max(det, 1.0e-20f32));
-    let pi = core::f32::consts::PI;
-    let img_w_f = u.img_w as f32;
-    let img_h_f = u.img_h as f32;
-    let area_frac = pi * sqrt_det / (img_w_f * img_h_f);
-    let dloss_darea =
-        2.0f32 * u.screen_area_penalty * area_frac / f32::max(u.num_visible as f32, 1.0f32);
-    let inv_imghw = 1.0f32 / (img_w_f * img_h_f);
-    let half_pi_over_sqrtdet = pi * 0.5f32 / sqrt_det * inv_imghw;
-    let pi_over_sqrtdet = pi / sqrt_det * inv_imghw;
-    let v_cov2d = Sym2 {
-        c00: v_cov2d_image.c00 + dloss_darea * cov.c11 * half_pi_over_sqrtdet,
-        c01: v_cov2d_image.c01 + dloss_darea * (-cov.c01) * pi_over_sqrtdet,
-        c11: v_cov2d_image.c11 + dloss_darea * cov.c00 * half_pi_over_sqrtdet,
-    };
+    let v_cov2d = inverse2x2_vjp(conic_inv, v_inv);
 
     // covar = M * M^T (symmetric).
     let covar = m.outer_product_self();
@@ -239,6 +219,8 @@ pub fn project_backwards_kernel(
         Vec2::new(v_mean2d_x, v_mean2d_y),
         camera_model,
     );
+
+    let v_mean_c = Vec3A::new(v_mean_c.x(), v_mean_c.y(), v_mean_c.z() + v_depth_in);
 
     // v_covar_c = J^T * v_cov2d * J (2x2 sym → 3x3 sym).
     let vcc = cam_jac.transpose_congruence_sym2(v_cov2d);
