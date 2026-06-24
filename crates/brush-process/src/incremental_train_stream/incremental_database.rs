@@ -11,6 +11,7 @@ use rand::rngs::StdRng;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::{mem, thread};
+use burn::tensor::TensorData;
 
 #[derive(Clone, Default)]
 struct Inner {
@@ -60,15 +61,18 @@ impl IncrementalDatabase {
         let frame_id = self.view_sampler.sample(&mut self.rng);
         let camera = *self.inner.train_poses.get(&frame_id).unwrap();
         let image = self.inner.image_data.get(&frame_id).unwrap().clone();
+        let depth = self.inner.depth_data.get(&frame_id).unwrap().clone();
 
         let (img_packed, has_alpha) = sample_to_packed_data_witout_copy(&image);
+
+        let depth_tensor = TensorData::new((*depth).clone(), [image.height(), image.width()]);
 
         SceneBatch {
             img_packed,
             has_alpha,
             alpha_mode: AlphaMode::Masked,
             camera,
-            depth: todo!()
+            depth: Some(depth_tensor),
         }
     }
 
