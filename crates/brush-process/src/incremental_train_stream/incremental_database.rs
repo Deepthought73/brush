@@ -4,18 +4,19 @@ use crate::incremental_train_stream::{FrameId, ImageData, PoseData};
 use brush_dataset::scene::{SceneBatch, sample_to_packed_data_witout_copy};
 use brush_render::AlphaMode;
 use brush_render::camera::Camera;
+use burn::tensor::TensorData;
 use dashmap::{DashMap, DashSet};
 use image::DynamicImage;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::{mem, thread};
-use burn::tensor::TensorData;
 
 #[derive(Clone, Default)]
 struct Inner {
     train_poses: Arc<DashMap<FrameId, Camera>>,
+    pose_updates: Arc<Mutex<Vec<(FrameId, Camera)>>>,
     eval_poses: Arc<DashMap<FrameId, Camera>>,
     image_data: Arc<DashMap<FrameId, Arc<DynamicImage>>>,
     depth_data: Arc<DashMap<FrameId, Arc<Vec<f32>>>>,
@@ -98,11 +99,29 @@ impl IncrementalDatabase {
             .collect()
     }
 
+    pub fn collect_pose_updates(&mut self) -> Vec<(FrameId, glam::Vec3, glam::Quat)> {
+        let pose_updates = mem::take(&mut *self.inner.pose_updates.lock().unwrap());
+
+        let mut delta_poses = vec![];
+        for (frame_id, new_camera) in pose_updates.iter() {
+            let prev_camera = *self.inner.train_poses.get(frame_id).unwrap();
+            self.inner.train_poses.insert(*frame_id, *new_camera);
+
+            let delta_q = new_camera.rotation * prev_camera.rotation.inverse();
+            let delta_t = new_camera.position - delta_q * prev_camera.position;
+            delta_poses.push((*frame_id, delta_t, delta_q));
+        }
+
+        delta_poses
+    }
+
     pub fn total_view_count(&self) -> usize {
         self.inner.total_poses.load(Ordering::Relaxed)
     }
 
-    pub fn get_unregistered_frames(&mut self) -> Vec<(Camera, Arc<DynamicImage>, Arc<Vec<f32>>)> {
+    pub fn get_unregistered_frames(
+        &mut self,
+    ) -> Vec<(FrameId, Camera, Arc<DynamicImage>, Arc<Vec<f32>>)> {
         let unregistered_frame_ids = {
             let mut guard = self.inner.unregistered_frame_ids.write().unwrap();
             mem::take(&mut *guard)
@@ -119,7 +138,7 @@ impl IncrementalDatabase {
                 {
                     let camera = *self.inner.train_poses.get(&frame_id).unwrap();
                     self.view_sampler.added_new_item(frame_id);
-                    Some((camera, image.clone(), depth.clone()))
+                    Some((frame_id, camera, image.clone(), depth.clone()))
                 } else {
                     guard.insert(frame_id);
                     None
@@ -149,6 +168,7 @@ fn spawn_pose_receiver(
 ) -> thread::JoinHandle<()> {
     let Inner {
         train_poses,
+        pose_updates,
         eval_poses,
         total_poses,
         unregistered_frame_ids,
@@ -158,25 +178,39 @@ fn spawn_pose_receiver(
     let eval_every = config.load_config.eval_split_every;
 
     thread::spawn(move || {
-        while let Ok(data) = pose_receiver.recv() {
+        while let Ok(new_pose) = pose_receiver.recv() {
             let mut camera = unit_camera;
-            camera.position = data.translation;
-            camera.rotation = data.quat;
+            camera.position = new_pose.translation;
+            camera.rotation = new_pose.quat;
 
-            if train_poses.contains_key(&data.frame_id) {
-                train_poses.insert(data.frame_id, camera);
-            } else if eval_poses.contains_key(&data.frame_id) {
-                eval_poses.insert(data.frame_id, camera);
+            if train_poses.contains_key(&new_pose.frame_id) {
+                if unregistered_frame_ids
+                    .read()
+                    .unwrap()
+                    .contains(&new_pose.frame_id)
+                {
+                    train_poses.insert(new_pose.frame_id, camera);
+                } else {
+                    pose_updates
+                        .lock()
+                        .unwrap()
+                        .push((new_pose.frame_id, camera));
+                }
+            } else if eval_poses.contains_key(&new_pose.frame_id) {
+                eval_poses.insert(new_pose.frame_id, camera);
             } else {
                 total_poses.fetch_add(1, Ordering::Relaxed);
 
                 if let Some(n) = eval_every
                     && total_poses.load(Ordering::Relaxed).is_multiple_of(n)
                 {
-                    eval_poses.insert(data.frame_id, camera);
+                    eval_poses.insert(new_pose.frame_id, camera);
                 } else {
-                    train_poses.insert(data.frame_id, camera);
-                    unregistered_frame_ids.read().unwrap().insert(data.frame_id);
+                    train_poses.insert(new_pose.frame_id, camera);
+                    unregistered_frame_ids
+                        .read()
+                        .unwrap()
+                        .insert(new_pose.frame_id);
                 }
             }
         }

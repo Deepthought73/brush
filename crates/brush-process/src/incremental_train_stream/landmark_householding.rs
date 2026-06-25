@@ -1,4 +1,4 @@
-use crate::incremental_train_stream::IncrementalTrainContext;
+use crate::incremental_train_stream::{FrameId, IncrementalTrainContext};
 use brush_render::Splats;
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{SplatRenderMode, inverse_sigmoid};
@@ -6,10 +6,13 @@ use brush_render::shaders::SH_C0;
 use brush_serde::SplatData;
 use brush_train::to_init_splats;
 use burn::Tensor;
+use burn::module::Param;
+use burn::tensor::TensorData;
 use dashmap::DashSet;
 use image::DynamicImage;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
+use wasm_bindgen_test::Instant;
 
 impl IncrementalTrainContext {
     async fn ensure_occupancy_grid_valid(&mut self) {
@@ -38,7 +41,7 @@ impl IncrementalTrainContext {
         camera: Camera,
         image: Arc<DynamicImage>,
         depth: Arc<Vec<f32>>,
-    ) {
+    ) -> (usize, usize) {
         let mut means = vec![];
         let mut sh_coeffs = vec![];
         let mut log_scales = vec![];
@@ -94,7 +97,7 @@ impl IncrementalTrainContext {
             log_scales.extend_from_slice(&[log_s, log_s, log_s]);
         }
 
-        self.add_new_landmarks_by_means(means, Some(sh_coeffs), Some(log_scales));
+        self.add_new_landmarks_by_means(means, Some(sh_coeffs), Some(log_scales))
     }
 
     fn add_new_landmarks_by_means(
@@ -102,7 +105,7 @@ impl IncrementalTrainContext {
         means: Vec<f32>,
         sh_coeffs: Option<Vec<f32>>,
         log_scales: Option<Vec<f32>>,
-    ) {
+    ) -> (usize, usize) {
         let sh_degree = self.config.model_config.sh_degree;
         let render_mode = self
             .config
@@ -129,10 +132,80 @@ impl IncrementalTrainContext {
         )
         .with_sh_degree(sh_degree);
 
-        self.splats = Some(match self.splats.take() {
+        let splats = self.splats.take();
+
+        let splats_before = splats.as_ref().map(|it| it.num_splats()).unwrap_or(0) as usize;
+        let splats_after = splats_before + n_splats;
+
+        self.splats = Some(match splats {
             None => new_splat,
             Some(existing) => concat_splats(&existing, &new_splat, render_mode),
         });
+
+        (splats_before, splats_after)
+    }
+
+    pub async fn update_poses(&mut self) {
+        let start = Instant::now();
+
+        let pose_updates = self.database.collect_pose_updates();
+
+        if pose_updates.is_empty() {
+            return;
+        }
+
+        let updates: Vec<(glam::Vec3, glam::Quat, usize, usize)> = pose_updates
+            .into_iter()
+            .map(|(frame_id, delta_d, delta_q)| {
+                let (start, end) = self.corresponding_splats.get(&frame_id).unwrap();
+                (delta_d, delta_q, *start, *end)
+            })
+            .collect();
+
+        let Some(splats) = self.splats.as_mut() else {
+            return;
+        };
+
+        let id = splats.transforms.id;
+        let device = splats.transforms.device();
+        let dims = splats.transforms.dims();
+        let mut data = splats
+            .transforms
+            .val()
+            .into_data_async()
+            .await
+            .expect("failed to read splat transforms")
+            .into_vec::<f32>()
+            .expect("transforms tensor should be f32");
+
+        for (delta_d, delta_q, start, end) in updates {
+            for i in start..end {
+                let base = i * 10;
+
+                let mean = glam::Vec3::new(data[base], data[base + 1], data[base + 2]);
+                let mean = delta_q * mean + delta_d;
+                data[base] = mean.x;
+                data[base + 1] = mean.y;
+                data[base + 2] = mean.z;
+
+                let q = glam::Quat::from_xyzw(
+                    data[base + 4],
+                    data[base + 5],
+                    data[base + 6],
+                    data[base + 3],
+                );
+                let q = (delta_q * q).normalize();
+                data[base + 3] = q.w;
+                data[base + 4] = q.x;
+                data[base + 5] = q.y;
+                data[base + 6] = q.z;
+            }
+        }
+
+        let transforms = Tensor::from_data(TensorData::new(data, dims), &device);
+        splats.transforms = Param::initialized(id, transforms.detach().require_grad());
+
+        log::info!("Updating poses took {:?}", start.elapsed());
     }
 }
 

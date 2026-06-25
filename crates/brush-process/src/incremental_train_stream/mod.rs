@@ -14,6 +14,7 @@ use brush_train::eval::eval_stats;
 use brush_train::train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds};
 use burn::module::AutodiffModule;
 use image::DynamicImage;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -67,6 +68,7 @@ pub struct IncrementalTrainContext {
     config: TrainStreamConfig,
 
     occupancy_grid: Option<OccupancyGrid>,
+    corresponding_splats: HashMap<FrameId, (usize, usize)>,
 
     device: burn::tensor::Device,
 
@@ -99,6 +101,7 @@ impl IncrementalTrainContext {
             emitter,
             config,
             occupancy_grid: None,
+            corresponding_splats: Default::default(),
             device,
             up_axis: None,
             splat_sender_initialized: false,
@@ -118,6 +121,8 @@ impl IncrementalTrainContext {
                     .incremental_train_config
                     .add_gaussians_every_secs
             {
+                self.update_poses().await;
+
                 let unregistered_frames = self.database.get_unregistered_frames();
                 self.extend_gaussians(unregistered_frames).await;
                 last_gaussian_added = Instant::now();
@@ -293,25 +298,32 @@ impl IncrementalTrainContext {
         Ok(())
     }
 
-    async fn extend_gaussians(&mut self, frames: Vec<(Camera, Arc<DynamicImage>, Arc<Vec<f32>>)>) {
+    async fn extend_gaussians(
+        &mut self,
+        frames: Vec<(FrameId, Camera, Arc<DynamicImage>, Arc<Vec<f32>>)>,
+    ) {
         if frames.is_empty() {
             return;
         }
 
         log::info!("Add new Gaussians with new {} views", frames.len());
 
-        self.update_last_images(frames.last().unwrap().1.clone())
+        self.update_last_images(frames.last().unwrap().2.clone())
             .await;
 
         if self.database.total_view_count() < 50 {
-            self.update_up_axis(frames.iter().map(|it| it.0));
+            self.update_up_axis(frames.iter().map(|it| it.1));
         }
 
-        for (camera, image, depth) in frames {
+        for (frame_id, camera, image, depth) in frames {
             let start = Instant::now();
-            self.add_new_landmarks_by_depth(camera, image, depth).await;
+            let (splats_idx_start, splats_idx_end) =
+                self.add_new_landmarks_by_depth(camera, image, depth).await;
             let elapsed = start.elapsed();
             log::info!("Adding new landmarks took: {elapsed:?}");
+
+            self.corresponding_splats
+                .insert(frame_id, (splats_idx_start, splats_idx_end));
         }
 
         if let Some(s) = &self.splats {
