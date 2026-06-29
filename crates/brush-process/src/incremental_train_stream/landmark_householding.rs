@@ -1,4 +1,4 @@
-use crate::incremental_train_stream::{FrameId, IncrementalTrainContext};
+use crate::incremental_train_stream::IncrementalTrainContext;
 use brush_render::Splats;
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{SplatRenderMode, inverse_sigmoid};
@@ -12,7 +12,7 @@ use dashmap::DashSet;
 use image::DynamicImage;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
-use wasm_bindgen_test::Instant;
+use std::time::Instant;
 
 impl IncrementalTrainContext {
     async fn ensure_occupancy_grid_valid(&mut self) {
