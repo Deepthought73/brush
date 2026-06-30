@@ -142,7 +142,7 @@ pub fn sample_to_packed_data(sample: DynamicImage) -> (TensorData, bool) {
     (TensorData::new(packed, [h as usize, w as usize]), has_alpha)
 }
 
-pub fn sample_to_packed_data_witout_copy(sample: &DynamicImage) -> (TensorData, bool) {
+pub fn sample_to_packed_data_without_copy(sample: &DynamicImage) -> (TensorData, bool) {
     let _span = tracing::trace_span!("sample_to_packed").entered();
     let (w, h) = (sample.width(), sample.height());
     let has_alpha = sample.color().has_alpha();

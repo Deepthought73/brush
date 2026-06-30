@@ -8850,6 +8850,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "single-view-experiment"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "brush-async",
+ "brush-dataset",
+ "brush-loss",
+ "brush-process",
+ "brush-render",
+ "brush-render-bwd",
+ "brush-serde",
+ "brush-train",
+ "brush-vfs",
+ "burn",
+ "burn-cubecl",
+ "burn-wgpu",
+ "bytemuck",
+ "clap",
+ "eframe",
+ "egui",
+ "egui_tiles",
+ "env_logger",
+ "glam",
+ "humantime",
+ "image",
+ "log",
+ "rand 0.10.1",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-tracy",
+ "web-time",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

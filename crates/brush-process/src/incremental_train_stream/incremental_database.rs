@@ -1,7 +1,7 @@
 use crate::config::TrainStreamConfig;
 use crate::incremental_train_stream::view_sampling::{ViewSampler, create_view_sampler};
 use crate::incremental_train_stream::{FrameId, ImageData, PoseData};
-use brush_dataset::scene::{SceneBatch, sample_to_packed_data_witout_copy};
+use brush_dataset::scene::{SceneBatch, sample_to_packed_data_without_copy};
 use brush_render::AlphaMode;
 use brush_render::camera::Camera;
 use burn::tensor::TensorData;
@@ -64,7 +64,7 @@ impl IncrementalDatabase {
         let image = self.inner.image_data.get(&frame_id).unwrap().clone();
         let depth = self.inner.depth_data.get(&frame_id).unwrap().clone();
 
-        let (img_packed, has_alpha) = sample_to_packed_data_witout_copy(&image);
+        let (img_packed, has_alpha) = sample_to_packed_data_without_copy(&image);
 
         let depth_tensor = TensorData::new((*depth).clone(), [image.height(), image.width()]);
 
