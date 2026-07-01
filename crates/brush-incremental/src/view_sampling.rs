@@ -1,4 +1,4 @@
-use crate::incremental_train_stream::FrameId;
+use crate::FrameId;
 use rand::RngExt;
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;

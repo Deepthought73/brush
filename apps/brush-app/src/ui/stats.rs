@@ -148,7 +148,6 @@ impl AppPane for StatsPanel {
                     self.training_complete = true;
                 }
                 TrainMessage::RefineStep { .. } => {}
-                _ => {}
             },
             _ => {}
         }

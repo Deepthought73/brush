@@ -1,6 +1,5 @@
 pub mod args_file;
 pub mod config;
-pub mod incremental_train_stream;
 pub mod message;
 pub mod slot;
 pub mod train_stream;

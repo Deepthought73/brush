@@ -19,6 +19,36 @@ pub struct EvalSample {
     pub render_aux: RenderAux,
 }
 
+/// Per-pixel SSIM map `[H, W, 3]` between the splats rendered from `gt_cam` and
+/// `gt_img`. Reduce over the channel axis for a `[H, W, 1]` heat map.
+pub async fn ssim_map(
+    splats: Splats,
+    gt_cam: &Camera,
+    gt_img: DynamicImage,
+    alpha_mode: AlphaMode,
+    device: &Device,
+) -> Tensor<3> {
+    let res = glam::uvec2(gt_img.width(), gt_img.height());
+
+    let (gt_packed_data, _has_alpha) =
+        sample_to_packed_data(view_to_sample_image(gt_img, alpha_mode));
+    let gt_packed: Tensor<2, Int> = Tensor::from_data(gt_packed_data, device);
+
+    let (img, _) = render_splats(splats, gt_cam, res, Vec3::ZERO, None, TextureMode::Float).await;
+    let render_rgb = img.slice(s![.., .., 0..3]);
+
+    image_loss_eval(
+        render_rgb,
+        gt_packed,
+        ImageLossConfig {
+            l1_weight: 0.0,
+            ssim_weight: 1.0,
+            composite_bg: None,
+            mask: false,
+        },
+    )
+}
+
 pub async fn eval_stats(
     splats: Splats,
     gt_cam: &Camera,

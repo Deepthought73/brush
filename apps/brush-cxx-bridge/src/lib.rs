@@ -1,10 +1,8 @@
 use crate::ffi::CameraModelId;
 use brush_app::ui::app::App;
-use brush_process::config::TrainStreamConfig;
-use brush_process::incremental_train_stream::incremental_database::IncrementalDatabase;
-use brush_process::incremental_train_stream::{
-    ImageData, PoseData, create_incremental_training_process,
-};
+use brush_incremental::config::IncrementalTrainConfig;
+use brush_incremental::incremental_database::IncrementalDatabase;
+use brush_incremental::{ImageData, PoseData, create_incremental_training_process};
 use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
 use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
@@ -43,7 +41,7 @@ mod ffi {
 }
 
 struct BrushBridge {
-    config: TrainStreamConfig,
+    config: IncrementalTrainConfig,
 
     image_sender: mpsc::Sender<ImageData>,
     pose_sender: mpsc::Sender<PoseData>,
@@ -208,9 +206,9 @@ impl BrushBridge {
     }
 }
 
-fn get_config(config_path: String) -> TrainStreamConfig {
+fn get_config(config_path: String) -> IncrementalTrainConfig {
     if config_path.is_empty() {
-        TrainStreamConfig::default()
+        IncrementalTrainConfig::default()
     } else {
         let config_path = PathBuf::from(config_path);
         if fs::exists(&config_path).unwrap_or(false) {
@@ -219,10 +217,10 @@ fn get_config(config_path: String) -> TrainStreamConfig {
         } else {
             serde_json::to_writer(
                 File::create(&config_path).unwrap(),
-                &TrainStreamConfig::default(),
+                &IncrementalTrainConfig::default(),
             )
             .unwrap();
-            TrainStreamConfig::default()
+            IncrementalTrainConfig::default()
         }
     }
 }

@@ -10,7 +10,7 @@ crate-type = ["staticlib"]
 
 [dependencies]
 # Brush deps.
-brush-process.path = "../../crates/brush-process"
+brush-incremental.path = "../../crates/brush-incremental"
 brush-dataset.path = "../../crates/brush-dataset"
 brush-render.path = "../../crates/brush-render"
 brush-serde.path = "../../crates/brush-serde"

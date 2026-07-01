@@ -283,7 +283,7 @@ impl SplatTrainer {
             // `- 1` margin (with relu) zeroes both cost and gradient, while a
             // needle's lone long axis drives the ratio up. Done in log space
             // where the scale params live: `exp(log_max - log_median)`.
-            if self.config.scale_ratio_penalty > 0.0 {
+            if self.config.anti_needle_loss_weight > 0.0 {
                 let log_scales = splats.log_scales(); // [N, 3]
                 let log_max = log_scales.clone().max_dim(1);
                 let log_min = log_scales.clone().min_dim(1);
@@ -291,7 +291,8 @@ impl SplatTrainer {
                 let log_median = log_scales.sum_dim(1) - log_max.clone() - log_min;
                 let ratio = (log_max - log_median).exp(); // max_scale / median_scale, >= 1
                 loss = loss
-                    + ratio.sub_scalar(1.0).clamp_min(0.0).mean() * self.config.scale_ratio_penalty;
+                    + ratio.sub_scalar(1.0).clamp_min(0.0).mean()
+                        * self.config.anti_needle_loss_weight;
             }
 
             // Strip the autodiff graph off the loss so consumers can read the
@@ -687,68 +688,6 @@ impl SplatTrainer {
                 total_splats: splat_count,
             },
         )
-    }
-
-    /// Lean refine for incremental training: prune dead/degenerate splats and,
-    /// when `reset_opacity` is set, hard-reset every gaussian's opacity (à la
-    /// 3DGS) by capping it at `reset_value` and clearing the opacity optimizer
-    /// moments so Adam doesn't immediately undo it. Subsequent steps then push
-    /// genuinely-needed gaussians back up while the rest decay below
-    /// `MIN_OPACITY` and get pruned on a later call. Optimizer + refine state
-    /// are kept in sync with the splat count. Returns the number pruned.
-    pub async fn prune_and_reset_opacity(
-        &mut self,
-        splats: Splats,
-        reset_opacity: bool,
-        reset_value: f32,
-    ) -> (Splats, u32) {
-        let splats = splats.bake_min_scale();
-
-        let refiner = self
-            .refine_record
-            .take()
-            .expect("Can only prune if refine stats are initialized");
-        let mut record = self
-            .optim
-            .take()
-            .expect("Can only prune after optimizer is initialized")
-            .to_record();
-
-        // Dead (below MIN_OPACITY) or non-finite opacity → prune.
-        let alpha_mask = splats.opacities().lower_elem(MIN_OPACITY);
-        let opac_bad = splats.raw_opacities.val().is_finite().bool_not();
-        let prune_mask = alpha_mask.bool_or(opac_bad);
-
-        let (mut splats, refiner, pruned_count) =
-            prune_points(splats, &mut record, refiner, prune_mask).await;
-
-        // Hard opacity reset: cap opacity at `reset_value` and zero the opacity
-        // optimizer moments so the reset isn't immediately reverted.
-        if reset_opacity {
-            let reset = reset_value.clamp(MIN_OPACITY, 1.0 - MIN_OPACITY);
-            splats.raw_opacities = splats.raw_opacities.map(|f| {
-                let capped = sigmoid(f).clamp(1e-12, reset);
-                inv_sigmoid(capped)
-            });
-            map_opt::<1>(splats.raw_opacities.id, &mut record, &|t| t.mul_scalar(0.0));
-        }
-
-        self.refine_record = Some(refiner);
-        self.optim = Some(create_optimizer_from_config().load_record(record));
-        (splats, pruned_count)
-    }
-
-    /// Soft opacity decay: subtract a constant `amount` from every gaussian's
-    /// (post-sigmoid) opacity. The optimizer pushes genuinely-needed gaussians
-    /// back up over the following steps; the rest drift toward `MIN_OPACITY`
-    /// and get pruned by `prune_and_reset_opacity`. Only touches the params, so
-    /// no optimizer-state sync is needed.
-    pub fn decay_opacity(&self, mut splats: Splats, amount: f32) -> Splats {
-        splats.raw_opacities = splats.raw_opacities.map(|f| {
-            let new_opac = sigmoid(f) - amount;
-            inv_sigmoid(new_opac.clamp(1e-12, 1.0 - 1e-12))
-        });
-        splats
     }
 
     fn refine_splats(

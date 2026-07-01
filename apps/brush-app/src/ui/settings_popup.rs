@@ -200,7 +200,7 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
         );
         slider(
             ui,
-            &mut tc.scale_ratio_penalty,
+            &mut tc.anti_needle_loss_weight,
             0.0..=1.0,
             "Scale ratio penalty (anti-needle)",
             false,
@@ -403,14 +403,6 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             args.load_config.alpha_mode = Some(alpha_mode);
         }
     }
-
-    ui.add_enabled(
-        enabled,
-        egui::Checkbox::new(
-            &mut args.load_config.estimate_metric_scale,
-            "Estimate metric scale",
-        ),
-    );
 
     ui.add_space(16.0);
 

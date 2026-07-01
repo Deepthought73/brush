@@ -1,15 +1,13 @@
-use crate::incremental_train_stream::incremental_database::IncrementalDatabase;
-use crate::incremental_train_stream::landmark_householding::OccupancyGrid;
-use crate::{
-    RunningProcess,
-    config::TrainStreamConfig,
-    message::{ProcessMessage, TrainMessage},
-    slot::SlotSender,
-    wait_for_device,
-};
+use crate::config::{IncrementalTrainConfig, LandmarkAddMode};
+use crate::incremental_database::IncrementalDatabase;
+use crate::landmark_householding::OccupancyGrid;
 use anyhow::Context;
 use async_fn_stream::{TryStreamEmitter, try_fn_stream};
+use brush_process::message::{ProcessMessage, TrainMessage};
+use brush_process::slot::SlotSender;
+use brush_process::{RunningProcess, slot, wait_for_device};
 use brush_render::{AlphaMode, camera::Camera, gaussian_splats::Splats};
+use brush_train::config::TrainConfig;
 use brush_train::eval::eval_stats;
 use brush_train::train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds};
 use burn::module::AutodiffModule;
@@ -41,9 +39,9 @@ pub struct PoseData {
 
 pub fn create_incremental_training_process(
     database: IncrementalDatabase,
-    config: TrainStreamConfig,
+    config: IncrementalTrainConfig,
 ) -> RunningProcess {
-    let (splat_tx, splat_view) = crate::slot::channel();
+    let (splat_tx, splat_view) = slot::channel();
 
     let stream = try_fn_stream(|emitter| async move {
         let mut train_ctx = IncrementalTrainContext::new(database, splat_tx, emitter, config).await;
@@ -63,9 +61,8 @@ pub struct IncrementalTrainContext {
     trainer: Option<SplatTrainer>,
     training_iteration: u32,
     training_start: Option<Instant>,
-    next_export_second: f64,
     splats: Option<Splats>,
-    config: TrainStreamConfig,
+    config: IncrementalTrainConfig,
 
     occupancy_grid: Option<OccupancyGrid>,
     corresponding_splats: HashMap<FrameId, (usize, usize)>,
@@ -85,10 +82,10 @@ impl IncrementalTrainContext {
         database: IncrementalDatabase,
         splat_sender: SlotSender<Splats>,
         emitter: TryStreamEmitter<ProcessMessage, anyhow::Error>,
-        config: TrainStreamConfig,
+        config: IncrementalTrainConfig,
     ) -> Self {
         let device: burn::tensor::Device = wait_for_device().await.clone().into();
-        device.seed(config.process_config.seed);
+        device.seed(config.seed);
 
         Self {
             database,
@@ -97,7 +94,6 @@ impl IncrementalTrainContext {
             trainer: None,
             training_iteration: 0,
             training_start: None,
-            next_export_second: config.process_config.export_every as f64,
             emitter,
             config,
             occupancy_grid: None,
@@ -112,61 +108,45 @@ impl IncrementalTrainContext {
     async fn run_train_loop(&mut self) -> anyhow::Result<()> {
         log::info!("Start training thread");
 
-        let mut last_gaussian_added = Instant::now();
+        let mut gaussians_added_count = 0.0;
+        let mut ui_update_count = 0.0;
+        let mut eval_count = 0.0;
 
         loop {
-            if last_gaussian_added.elapsed().as_secs_f64()
-                > self
-                    .config
-                    .incremental_train_config
-                    .add_gaussians_every_secs
-            {
+            let training_time = self
+                .training_start
+                .map_or(0.0, |it| it.elapsed().as_secs_f64());
+
+            if training_time >= self.config.add_gaussians_every_secs * gaussians_added_count {
                 self.update_poses().await;
 
                 let unregistered_frames = self.database.get_unregistered_frames();
-                self.extend_gaussians(unregistered_frames).await;
-                last_gaussian_added = Instant::now();
-
-                self.update_ui_dataset().await;
+                if !unregistered_frames.is_empty() {
+                    gaussians_added_count += 1.0;
+                    self.extend_gaussians(unregistered_frames).await;
+                    self.update_ui_dataset().await;
+                }
             }
 
             if self.trainer.is_some() && self.splats.is_some() && !self.database.is_empty() {
                 self.train_step().await;
 
-                let decay_every = self.config.incremental_train_config.opacity_decay_every;
-                if decay_every > 0 && self.training_iteration.is_multiple_of(decay_every) {
-                    self.decay_opacity();
-                }
-
-                let refine_every = self.config.train_config.refine_every;
-                if self.training_iteration > 0
-                    && self.training_iteration.is_multiple_of(refine_every)
-                {
-                    self.prune_and_maybe_reset_opacity().await;
-                }
-            }
-
-            if self.training_iteration > 0 {
-                if self.training_iteration.is_multiple_of(100) {
+                if training_time >= self.config.update_ui_every_sec * ui_update_count {
                     self.update_train_status_ui().await;
                     self.update_splat_in_ui().await;
+                    ui_update_count += 1.0;
                 }
 
-                if self
-                    .training_iteration
-                    .is_multiple_of(self.config.process_config.eval_every)
+                if let Some(eval_every) = self.config.eval_every_sec
+                    && training_time >= eval_every * eval_count
                 {
                     self.eval_step().await?;
-                }
-            }
 
-            if let Some(training_start) = self.training_start {
-                let training_time = training_start.elapsed().as_secs_f64();
-                if training_time > self.next_export_second {
-                    self.next_export_second += self.config.process_config.export_every as f64;
-                    let start = Instant::now();
-                    self.export_checkpoint().await?;
-                    log::info!("Export took: {:?}", start.elapsed());
+                    if self.config.export_on_eval {
+                        self.export_checkpoint().await?;
+                    }
+
+                    eval_count += 1.0;
                 }
             }
 
@@ -197,60 +177,6 @@ impl IncrementalTrainContext {
 
         self.splat_sender
             .set(0, self.splats.as_ref().unwrap().clone());
-    }
-
-    /// Soft opacity decay applied on its own cadence: nudges every gaussian's
-    /// opacity down so unneeded ones drift toward the prune threshold.
-    fn decay_opacity(&mut self) {
-        if self.splats.is_none() {
-            return;
-        }
-        let amount = self.config.incremental_train_config.opacity_decay_amount;
-        let current = self.splats.take().unwrap();
-        let new_splats = self
-            .trainer
-            .as_ref()
-            .unwrap()
-            .decay_opacity(current, amount);
-        self.splats = Some(new_splats);
-    }
-
-    /// Prune dead gaussians every refine, and hard-reset opacity on the
-    /// configured cadence so unneeded gaussians reveal themselves and get
-    /// pruned on a later pass.
-    async fn prune_and_maybe_reset_opacity(&mut self) {
-        if self.splats.is_none() {
-            return;
-        }
-
-        let cfg = &self.config.incremental_train_config;
-        let reset_opacity = cfg.opacity_reset_every > 0
-            && self
-                .training_iteration
-                .is_multiple_of(cfg.opacity_reset_every);
-        let reset_value = cfg.opacity_reset_value;
-
-        let current = self.splats.take().unwrap();
-        let before_num = current.num_splats();
-        let (new_splats, pruned) = self
-            .trainer
-            .as_mut()
-            .unwrap()
-            .prune_and_reset_opacity(current, reset_opacity, reset_value)
-            .await;
-        let after_num = new_splats.num_splats();
-        if reset_opacity {
-            log::info!("Opacity reset + prune: {before_num} -> {after_num} ({pruned} pruned)");
-        } else {
-            log::info!("Prune: {before_num} -> {after_num} ({pruned} pruned)");
-        }
-        self.emitter
-            .emit(ProcessMessage::TrainMessage(TrainMessage::RefineStep {
-                cur_splat_count: after_num,
-                iter: self.training_iteration,
-            }))
-            .await;
-        self.splats = Some(new_splats);
     }
 
     async fn eval_step(&self) -> anyhow::Result<()> {
@@ -308,17 +234,23 @@ impl IncrementalTrainContext {
 
         log::info!("Add new Gaussians with new {} views", frames.len());
 
-        self.update_last_images(frames.last().unwrap().2.clone())
-            .await;
-
         if self.database.total_view_count() < 50 {
             self.update_up_axis(frames.iter().map(|it| it.1));
         }
 
+        let add_mode = self.config.landmark_add_mode;
+
         for (frame_id, camera, image, depth) in frames {
             let start = Instant::now();
-            let (splats_idx_start, splats_idx_end) =
-                self.add_new_landmarks_by_depth(camera, image, depth).await;
+            let (splats_idx_start, splats_idx_end) = match add_mode {
+                LandmarkAddMode::OccupancyGrid => {
+                    self.add_new_landmarks_by_depth(camera, image, depth).await
+                }
+                LandmarkAddMode::SsimDensification => {
+                    self.add_new_landmarks_by_ssim_densification(camera, image, depth)
+                        .await
+                }
+            };
             let elapsed = start.elapsed();
             log::info!("Adding new landmarks took: {elapsed:?}");
 
@@ -329,7 +261,7 @@ impl IncrementalTrainContext {
         if let Some(s) = &self.splats {
             let bounds = get_splat_bounds(s.clone(), BOUND_PERCENTILE).await;
             self.trainer = Some(SplatTrainer::new(
-                &self.config.train_config,
+                &TrainConfig::default(),
                 &self.device,
                 bounds,
             ));
@@ -338,15 +270,18 @@ impl IncrementalTrainContext {
 
     async fn export_checkpoint(&self) -> Result<(), anyhow::Error> {
         if let Some(splats) = self.splats.clone() {
-            let export_path = PathBuf::from(&self.config.process_config.export_path);
+            let secs = self.training_start.unwrap().elapsed().as_millis();
+            let num_splats = splats.num_splats();
+
+            let export_path = PathBuf::from(&self.config.export_path);
             tokio::fs::create_dir_all(&export_path)
                 .await
                 .with_context(|| format!("Creating export directory {}", export_path.display()))?;
-            let splat_data = brush_serde::splat_to_ply(splats)
+            let splat_data = brush_serde::splat_to_ply(splats, self.up_axis)
                 .await
                 .context("Serializing splat data")?;
             tokio::fs::write(
-                export_path.join(format!("{}.ply", self.training_iteration)),
+                export_path.join(format!("{}_{}.ply", secs, num_splats)),
                 splat_data,
             )
             .await

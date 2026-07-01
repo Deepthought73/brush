@@ -1,11 +1,11 @@
-use crate::incremental_train_stream::{FrameId, IncrementalTrainContext};
-use crate::message::{ProcessMessage, TrainMessage};
+use crate::{FrameId, IncrementalTrainContext};
 use brush_dataset::Dataset;
 use brush_dataset::load_image::LoadImage;
 use brush_dataset::scene::SceneView;
+use brush_process::config::TrainStreamConfig;
+use brush_process::message::{ProcessMessage, TrainMessage};
 use brush_render::camera::Camera;
 use brush_vfs::BrushVfs;
-use image::DynamicImage;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ impl IncrementalTrainContext {
             .await;
         self.emitter
             .emit(ProcessMessage::TrainMessage(TrainMessage::TrainConfig {
-                config: Box::new(self.config.clone()),
+                config: Box::new(TrainStreamConfig::default()),
             }))
             .await;
     }
@@ -93,14 +93,6 @@ impl IncrementalTrainContext {
             }))
             .await;
     }
-
-    pub async fn update_last_images(&self, image: Arc<DynamicImage>) {
-        self.emitter
-            .emit(ProcessMessage::TrainMessage(TrainMessage::NewImage {
-                image,
-            }))
-            .await;
-    }
 }
 
 fn collect_scene_views(iter: dashmap::iter::Iter<'_, FrameId, Camera>) -> Vec<SceneView> {
@@ -109,7 +101,6 @@ fn collect_scene_views(iter: dashmap::iter::Iter<'_, FrameId, Camera>) -> Vec<Sc
         SceneView {
             image: LoadImage::new(Arc::new(BrushVfs::empty()), img_path, None, u32::MAX, None),
             camera: *view.value(),
-            depth: None,
         }
     })
     .collect()

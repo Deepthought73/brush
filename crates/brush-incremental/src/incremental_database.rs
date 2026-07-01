@@ -1,6 +1,6 @@
-use crate::config::TrainStreamConfig;
-use crate::incremental_train_stream::view_sampling::{ViewSampler, create_view_sampler};
-use crate::incremental_train_stream::{FrameId, ImageData, PoseData};
+use crate::config::IncrementalTrainConfig;
+use crate::view_sampling::{ViewSampler, create_view_sampler};
+use crate::{FrameId, ImageData, PoseData};
 use brush_dataset::scene::{SceneBatch, sample_to_packed_data_without_copy};
 use brush_render::AlphaMode;
 use brush_render::camera::Camera;
@@ -35,17 +35,16 @@ impl IncrementalDatabase {
         image_receiver: mpsc::Receiver<ImageData>,
         pose_receiver: mpsc::Receiver<PoseData>,
         unit_camera: Camera,
-        config: &TrainStreamConfig,
+        config: &IncrementalTrainConfig,
     ) -> Self {
         let inner = Inner::default();
 
-        let view_sampler =
-            create_view_sampler(&config.incremental_train_config.view_sampling_strategy);
+        let view_sampler = create_view_sampler(&config.view_sampling_strategy);
 
         spawn_image_receiver(image_receiver, inner.clone());
         spawn_pose_receiver(pose_receiver, unit_camera, config, inner.clone());
 
-        let rng = StdRng::from_seed([config.process_config.seed as u8; 32]);
+        let rng = StdRng::from_seed([config.seed as u8; 32]);
 
         Self {
             inner,
@@ -163,7 +162,7 @@ fn spawn_image_receiver(
 fn spawn_pose_receiver(
     pose_receiver: mpsc::Receiver<PoseData>,
     unit_camera: Camera,
-    config: &TrainStreamConfig,
+    config: &IncrementalTrainConfig,
     inner: Inner,
 ) -> thread::JoinHandle<()> {
     let Inner {
@@ -175,7 +174,7 @@ fn spawn_pose_receiver(
         ..
     } = inner;
 
-    let eval_every = config.load_config.eval_split_every;
+    let eval_every = config.eval_split_every;
 
     thread::spawn(move || {
         while let Ok(new_pose) = pose_receiver.recv() {
@@ -201,8 +200,9 @@ fn spawn_pose_receiver(
             } else {
                 total_poses.fetch_add(1, Ordering::Relaxed);
 
-                if let Some(n) = eval_every
-                    && total_poses.load(Ordering::Relaxed).is_multiple_of(n)
+                if total_poses
+                    .load(Ordering::Relaxed)
+                    .is_multiple_of(eval_every)
                 {
                     eval_poses.insert(new_pose.frame_id, camera);
                 } else {

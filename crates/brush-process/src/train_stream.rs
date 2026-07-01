@@ -6,7 +6,7 @@ use crate::{
     wait_for_device,
 };
 use anyhow::Context;
-use brush_dataset::{load_dataset, scene::Scene};
+use brush_dataset::{load_dataset, scene::Scene, scene_loader::SceneLoader};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_rerun::visualize_tools::VisualizeTools;
 use brush_train::{
@@ -27,7 +27,6 @@ use std::{path::PathBuf, sync::Arc};
 #[allow(unused)]
 use std::path::Path;
 
-use brush_dataset::scene_loader::SceneLoader;
 use tracing::{Instrument, trace_span};
 use web_time::{Duration, Instant};
 
@@ -172,8 +171,7 @@ pub(crate) async fn train_stream(
     let mut eval_scene = dataset.eval;
 
     let mut train_duration = Duration::from_secs(0);
-    let mut dataloader = SceneLoader::new(&dataset.train, 42);
-
+    let mut dataloader = SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config);
     let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
 
     // Per-train-view (world center, focal-px at native res) for the
@@ -237,10 +235,16 @@ pub(crate) async fn train_stream(
                         .replace(".ply", &format!("_lod{current_lod}.ply"));
                     (lod_name, lod_refine_steps, lod_refine_steps)
                 };
-                let res =
-                    export_checkpoint(splats.clone(), &export_path, &name, exp_iter, exp_total)
-                        .await
-                        .with_context(|| "Export at LOD boundary failed");
+                let res = export_checkpoint(
+                    splats.clone(),
+                    &export_path,
+                    &name,
+                    exp_iter,
+                    exp_total,
+                    up_axis,
+                )
+                .await
+                .with_context(|| "Export at LOD boundary failed");
 
                 if let Err(error) = res {
                     emitter.emit(ProcessMessage::Warning { error }).await;
@@ -270,9 +274,9 @@ pub(crate) async fn train_stream(
             let cumulative_scale = (lod_img_pct as f32 / 100.0).powi(current_lod as i32);
             dataloader = if lod_img_pct < 100 {
                 let lod_scene = dataset.train.clone().with_image_scale(cumulative_scale);
-                SceneLoader::new(&lod_scene, 42)
+                SceneLoader::new(&lod_scene, 42, &train_stream_config.load_config)
             } else {
-                SceneLoader::new(&dataset.train, 42)
+                SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config)
             };
 
             let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
@@ -294,10 +298,11 @@ pub(crate) async fn train_stream(
 
         // Lift splats onto the autodiff graph for this step, run training,
         // then strip back to inner so the viewer slot sees plain splats.
-        let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats.clone());
+        // `step` immediately replaces `splats` with the returned value, so we
+        // can move it here instead of cloning every iteration.
+        let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats);
         let (new_diff_splats, stats) = trainer.step(batch, diff_splats).await;
         splats = new_diff_splats.valid();
-        slot.set(0, splats.clone());
 
         // Phase-local iteration for refine gating
         let phase_iter = if current_lod == 0 {
@@ -319,7 +324,6 @@ pub(crate) async fn train_stream(
         {
             let (new_splats, refine_stats) = trainer.refine(iter, splats).await;
             splats = new_splats;
-            slot.set(0, splats.clone());
             refine_stats
         } else {
             RefineStats {
@@ -331,6 +335,7 @@ pub(crate) async fn train_stream(
                 total_splats: splats.num_splats(),
             }
         };
+        slot.set(0, splats.clone());
         let refine_dur = refine_start.elapsed();
 
         // We just finished iter 'iter', now starting iter + 1.
@@ -386,10 +391,16 @@ pub(crate) async fn train_stream(
                         .replace(".ply", &format!("_lod{current_lod}.ply"));
                     (lod_name, lod_refine_steps, lod_refine_steps)
                 };
-                let res =
-                    export_checkpoint(splats.clone(), &export_path, &name, exp_iter, exp_total)
-                        .await
-                        .with_context(|| format!("Export at iteration {iter} failed"));
+                let res = export_checkpoint(
+                    splats.clone(),
+                    &export_path,
+                    &name,
+                    exp_iter,
+                    exp_total,
+                    up_axis,
+                )
+                .await
+                .with_context(|| format!("Export at iteration {iter} failed"));
 
                 if let Err(error) = res {
                     emitter.emit(ProcessMessage::Warning { error }).await;
@@ -567,13 +578,14 @@ async fn export_checkpoint(
     export_name: &str,
     iter: u32,
     total_steps: u32,
+    up_axis: Option<glam::Vec3>,
 ) -> Result<(), anyhow::Error> {
     tokio::fs::create_dir_all(&export_path)
         .await
         .with_context(|| format!("Creating export directory {}", export_path.display()))?;
     let digits = ((total_steps as f64).log10().floor() as usize) + 1;
     let export_name = export_name.replace("{iter}", &format!("{iter:0digits$}"));
-    let splat_data = brush_serde::splat_to_ply(splats)
+    let splat_data = brush_serde::splat_to_ply(splats, up_axis)
         .await
         .context("Serializing splat data")?;
     tokio::fs::write(export_path.join(&export_name), splat_data)

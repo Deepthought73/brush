@@ -1,4 +1,3 @@
-use crate::incremental_train_stream::config::IncrementalTrainConfig;
 use clap::{Args, Parser};
 use serde::{Deserialize, Serialize};
 
@@ -59,16 +58,13 @@ pub struct TrainStreamConfig {
     pub model_config: brush_dataset::config::ModelConfig,
     #[clap(flatten)]
     #[serde(flatten)]
-    pub load_config: brush_dataset::config::LoadDataseConfig,
+    pub load_config: brush_dataset::config::LoadDatasetConfig,
     #[clap(flatten)]
     #[serde(flatten)]
     pub process_config: ProcessConfig,
     #[clap(flatten)]
     #[serde(flatten)]
     pub rerun_config: brush_rerun::RerunConfig,
-    #[clap(flatten)]
-    #[serde(flatten)]
-    pub incremental_train_config: IncrementalTrainConfig,
 }
 
 impl Default for TrainStreamConfig {

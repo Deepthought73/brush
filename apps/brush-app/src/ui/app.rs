@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::trace_span;
 
-use crate::ui::last_image_panel::LastImagePanel;
 use crate::ui::{
     UiMode, camera_controls::CameraClamping, datasets::DatasetPanel, log_panel::LogPanel,
     panels::AppPane, scene::ScenePanel, settings_panel::SettingsPanel, stats::StatsPanel,
@@ -23,7 +22,6 @@ pub enum Pane {
     Scene(#[serde(skip)] ScenePanel),
     Stats(#[serde(skip)] StatsPanel),
     Dataset(#[serde(skip)] DatasetPanel),
-    LastImage(#[serde(skip)] LastImagePanel),
     Training(#[serde(skip)] TrainingPanel),
     Settings(#[serde(skip)] SettingsPanel),
     Log(#[serde(skip)] LogPanel),
@@ -35,7 +33,6 @@ impl Pane {
             Self::Scene(p) => p,
             Self::Stats(p) => p,
             Self::Dataset(p) => p,
-            Self::LastImage(p) => p,
             Self::Training(p) => p,
             Self::Settings(p) => p,
             Self::Log(p) => p,
@@ -47,7 +44,6 @@ impl Pane {
             Self::Scene(p) => p,
             Self::Stats(p) => p,
             Self::Dataset(p) => p,
-            Self::LastImage(p) => p,
             Self::Training(p) => p,
             Self::Settings(p) => p,
             Self::Log(p) => p,
@@ -66,10 +62,6 @@ impl Pane {
 
     fn dataset() -> RefCell<Self> {
         RefCell::new(Self::Dataset(DatasetPanel::default()))
-    }
-
-    fn last_image_pane() -> RefCell<Self> {
-        RefCell::new(Self::LastImage(LastImagePanel::default()))
     }
 
     fn training() -> RefCell<Self> {
@@ -151,7 +143,7 @@ impl egui_tiles::Behavior<PaneRef> for AppTree {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Default)]
 pub struct CameraSettings {
     pub speed_scale: Option<f32>,
     pub splat_scale: Option<f32>,
@@ -162,22 +154,6 @@ pub struct CameraSettings {
     pub use_distortion_model: bool,
     pub show_frustums: bool,
     pub frustum_scale: Option<f32>,
-}
-
-impl Default for CameraSettings {
-    fn default() -> Self {
-        Self {
-            speed_scale: None,
-            splat_scale: None,
-            background: None,
-            grid_enabled: None,
-            depth_view: false,
-            clamping: Default::default(),
-            use_distortion_model: false,
-            show_frustums: true,
-            frustum_scale: Some(0.02),
-        }
-    }
 }
 
 const TREE_STORAGE_KEY: &str = "brush_tile_tree_v3";
@@ -195,7 +171,6 @@ impl App {
         let root_id = {
             let stats_pane = tiles.insert_pane(Pane::stats());
             let dataset_pane = tiles.insert_pane(Pane::dataset());
-            let last_image_pane = tiles.insert_pane(Pane::last_image_pane());
             let training_pane = tiles.insert_pane(Pane::training());
             let settings_pane = tiles.insert_pane(Pane::settings());
             let log_pane = tiles.insert_pane(Pane::log());
@@ -204,7 +179,6 @@ impl App {
                 scene_pane,
                 stats_pane,
                 dataset_pane,
-                last_image_pane,
                 training_pane,
                 settings_pane,
                 log_pane,
@@ -225,7 +199,6 @@ impl App {
             && has(tree, |p| matches!(p, Pane::Stats(_)))
             && has(tree, |p| matches!(p, Pane::Dataset(_)))
             && has(tree, |p| matches!(p, Pane::Training(_)))
-            && has(tree, |p| matches!(p, Pane::LastImage(_)))
             && has(tree, |p| matches!(p, Pane::Settings(_)))
             && has(tree, |p| matches!(p, Pane::Log(_)))
     }
@@ -285,7 +258,6 @@ impl App {
         scene_pane: TileId,
         stats_pane: TileId,
         dataset_pane: TileId,
-        last_image_pane: TileId,
         training_pane: TileId,
         settings_pane: TileId,
         log_pane: TileId,
@@ -295,7 +267,7 @@ impl App {
 
         let mut sidebar = egui_tiles::Linear::new(
             egui_tiles::LinearDir::Vertical,
-            vec![training_pane, dataset_pane, last_image_pane, bottom_tabs],
+            vec![training_pane, dataset_pane, bottom_tabs],
         );
         sidebar.shares.set_share(training_pane, 0.12);
         sidebar.shares.set_share(dataset_pane, 0.53);
@@ -362,7 +334,6 @@ impl eframe::App for App {
             let scene_pane = find_pane(&tree.tiles, |p| matches!(p, Pane::Scene(_)));
             let stats_pane = find_pane(&tree.tiles, |p| matches!(p, Pane::Stats(_)));
             let dataset_pane = find_pane(&tree.tiles, |p| matches!(p, Pane::Dataset(_)));
-            let last_image_pane = find_pane(&tree.tiles, |p| matches!(p, Pane::LastImage(_)));
             let training_pane = find_pane(&tree.tiles, |p| matches!(p, Pane::Training(_)));
             let settings_pane = find_pane(&tree.tiles, |p| matches!(p, Pane::Settings(_)));
             let log_pane = find_pane(&tree.tiles, |p| matches!(p, Pane::Log(_)));
@@ -383,7 +354,6 @@ impl eframe::App for App {
                 scene_pane,
                 stats_pane,
                 dataset_pane,
-                last_image_pane,
                 training_pane,
                 settings_pane,
                 log_pane,

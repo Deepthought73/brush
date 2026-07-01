@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use web_time::Instant;
 
+use crate::ui::frustum_widget::CameraFrustumWidget;
 use crate::ui::panels::AppPane;
 use crate::ui::settings_popup::SettingsPopup;
 use crate::ui::splat_backbuffer::SplatBackbuffer;
 use crate::ui::ui_process::{BackgroundStyle, UiProcess};
 use crate::ui::widget_3d::GridWidget;
 use crate::ui::{UiMode, draw_checkerboard};
-use crate::ui::frustum_widget::CameraFrustumWidget;
 
 /// Controls how often the viewport re-renders during training.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

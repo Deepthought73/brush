@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     Dataset,
-    config::LoadDataseConfig,
+    config::LoadDatasetConfig,
     scene::{LoadImage, SceneView},
 };
 use brush_render::camera::{Camera, focal_to_fov};
@@ -60,7 +60,7 @@ fn col_f64(fields: &[&str], header: &HashMap<String, usize>, name: &str) -> f64 
 
 pub async fn read_dataset(
     vfs: Arc<BrushVfs>,
-    load_args: &LoadDataseConfig,
+    load_args: &LoadDatasetConfig,
 ) -> Option<Result<DatasetLoadResult, FormatError>> {
     let csv_paths: Vec<_> = vfs.files_with_extension("csv").collect();
 
@@ -87,7 +87,7 @@ pub async fn read_dataset(
 
 async fn read_dataset_inner(
     vfs: Arc<BrushVfs>,
-    load_args: &LoadDataseConfig,
+    load_args: &LoadDatasetConfig,
     contents: String,
 ) -> Result<DatasetLoadResult, FormatError> {
     let mut lines = contents.lines().filter(|l| !l.trim().is_empty());
@@ -149,11 +149,7 @@ async fn read_dataset_inner(
             continue;
         }
 
-        views.push(SceneView {
-            camera,
-            image,
-            depth: None,
-        });
+        views.push(SceneView { camera, image });
     }
 
     let (train_views, eval_views) = split_eval_every(views, load_args.eval_split_every);

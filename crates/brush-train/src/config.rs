@@ -86,7 +86,7 @@ pub struct TrainConfig {
     /// the others) while leaving plane-shaped ones (two comparable axes)
     /// untouched. 0 disables it.
     #[arg(long, help_heading = "Training options", default_value = "0.0")]
-    pub scale_ratio_penalty: f32,
+    pub anti_needle_loss_weight: f32,
 
     /// Factor of the opacity decay.
     #[arg(long, help_heading = "Training options", default_value = "0.004")]

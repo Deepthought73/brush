@@ -1,13 +1,9 @@
-
 [package]
-name = "brush-process"
+name = "brush-incremental"
 edition.workspace = true
 version.workspace = true
 readme.workspace = true
 license.workspace = true
-
-[features]
-debug-validation = ["brush-train/debug-validation"]
 
 [dependencies]
 brush-render.path = "../brush-render"
@@ -35,13 +31,18 @@ serde_json.workspace = true
 
 wgpu.workspace = true
 
-tokio = { workspace = true, features = ["io-util", "rt"] }
+tokio = { workspace = true, features = ["io-util", "rt", "fs", "time"] }
+image.workspace = true
 tokio-stream.workspace = true
 brush-async.path = "../brush-async"
+brush-process.path = "../brush-process"
 
 brush-train = { path = "../brush-train" }
 brush-dataset = { path = "../brush-dataset"}
 brush-rerun = { path = "../brush-rerun" }
+
+dashmap = "6.2.1"
+rayon.workspace = true
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

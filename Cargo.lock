@@ -224,9 +224,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "arbitrary"
@@ -978,7 +978,7 @@ dependencies = [
  "brush-app",
  "brush-async",
  "brush-dataset",
- "brush-process",
+ "brush-incremental",
  "brush-render",
  "brush-serde",
  "burn",
@@ -1027,14 +1027,51 @@ dependencies = [
  "itertools 0.14.0",
  "jpeg-decoder",
  "log",
+ "parse-size",
  "rand 0.10.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tiff",
  "tokio",
  "tracing",
  "wasm-bindgen-test",
+]
+
+[[package]]
+name = "brush-incremental"
+version = "0.3.0"
+dependencies = [
+ "alphanumeric-sort",
+ "anyhow",
+ "async-fn-stream",
+ "brush-async",
+ "brush-dataset",
+ "brush-process",
+ "brush-render",
+ "brush-render-bwd",
+ "brush-rerun",
+ "brush-serde",
+ "brush-train",
+ "brush-vfs",
+ "burn",
+ "burn-cubecl",
+ "burn-wgpu",
+ "clap",
+ "dashmap",
+ "getrandom 0.4.2",
+ "glam",
+ "image",
+ "log",
+ "rand 0.10.1",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "wasm-bindgen-test",
+ "web-time",
+ "wgpu",
 ]
 
 [[package]]
@@ -1109,13 +1146,10 @@ dependencies = [
  "burn-cubecl",
  "burn-wgpu",
  "clap",
- "dashmap",
  "getrandom 0.4.2",
  "glam",
- "image",
  "log",
  "rand 0.10.1",
- "rayon",
  "serde",
  "serde_json",
  "tokio",
@@ -6472,6 +6506,12 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "parse-size"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "487f2ccd1e17ce8c1bfab3a65c89525af41cfad4c8659021a1e9a2aacd73b89b"
 
 [[package]]
 name = "password-hash"
