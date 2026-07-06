@@ -1,16 +1,19 @@
 use crate::ffi::CameraModelId;
 use brush_app::ui::app::App;
 use brush_incremental::config::IncrementalTrainConfig;
-use brush_incremental::incremental_database::IncrementalDatabase;
-use brush_incremental::{ImageData, PoseData, create_incremental_training_process};
+use brush_incremental::{
+    ViewData, create_incremental_training_process, run_incremental_training_headless,
+};
 use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
 use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use image::DynamicImage;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::time::Instant;
 use std::{fs, mem};
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::mpsc;
 
 #[cxx::bridge]
 mod ffi {
@@ -33,24 +36,42 @@ mod ffi {
             img_height: u32,
             mask_path: &str,
         ) -> Box<BrushBridge>;
-        unsafe fn send_image(&self, frame_id: u64, image_ptr: *const u16, depth_ptr: *const f32);
-        fn new_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]);
-        fn update_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]);
-        fn run_ui(&mut self) -> Result<()>;
+
+        unsafe fn add_view_to_splat(
+            &mut self,
+            frame_id: u64,
+            image_ptr: *const u16,
+            depth_ptr: *const f32,
+            translation: [f32; 3],
+            quat: [f32; 4],
+            is_eval: bool,
+        );
+
+        fn stop(&mut self);
+
+        // fn new_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]);
+        // fn update_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]);
+
+        fn run(&mut self, with_ui: bool) -> Result<()>;
     }
 }
 
 struct BrushBridge {
     config: IncrementalTrainConfig,
 
-    image_sender: mpsc::Sender<ImageData>,
-    pose_sender: mpsc::Sender<PoseData>,
-    database: Option<IncrementalDatabase>,
+    view_sender: mpsc::Sender<ViewData>,
+    view_receiver: Option<mpsc::Receiver<ViewData>>,
+    done_sender: Option<mpsc::Sender<()>>,
+    done_receiver: mpsc::Receiver<()>,
 
+    unit_camera: Camera,
     img_width: u32,
     img_height: u32,
 
     mask_raw: Option<Vec<u8>>,
+
+    runtime: Runtime,
+    rt_handle: Handle,
 }
 
 fn create_brush_bridge(
@@ -61,8 +82,14 @@ fn create_brush_bridge(
     img_height: u32,
     mask_path: &str,
 ) -> Box<BrushBridge> {
-    let (image_sender, image_receiver) = mpsc::channel::<ImageData>();
-    let (pose_sender, pose_receiver) = mpsc::channel::<PoseData>();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to initialize tokio runtime");
+    let rt_handle = runtime.handle().clone();
+
+    let (view_sender, view_receiver) = mpsc::channel::<ViewData>(1);
+    let (done_sender, done_receiver) = mpsc::channel::<()>(1);
 
     let config = get_config(config_path);
 
@@ -100,22 +127,148 @@ fn create_brush_bridge(
         camera_model,
     );
 
-    let database = IncrementalDatabase::new(image_receiver, pose_receiver, unit_camera, &config);
-
     BrushBridge {
         config,
-        image_sender,
-        pose_sender,
-        database: Some(database),
+        view_sender,
+        view_receiver: Some(view_receiver),
+        done_sender: Some(done_sender),
+        done_receiver,
+        unit_camera,
         img_width,
         img_height,
         mask_raw,
+        runtime,
+        rt_handle,
     }
     .into()
 }
 
 impl BrushBridge {
-    unsafe fn send_image(&self, frame_id: u64, image_ptr: *const u16, depth_ptr: *const f32) {
+    fn add_view_to_splat(
+        &mut self,
+        frame_id: u64,
+        image_ptr: *const u16,
+        depth_ptr: *const f32,
+        translation: [f32; 3],
+        quat: [f32; 4],
+        is_eval: bool,
+    ) {
+        let image = unsafe { self.copy_into_rgba_image(image_ptr) };
+
+        let depth = if is_eval {
+            vec![]
+        } else {
+            // TODO try to pass depth data as shared_ptr to avoid copy
+            let pixel_count = (self.img_width * self.img_height) as usize;
+            let depth_slice = unsafe { std::slice::from_raw_parts(depth_ptr, pixel_count) };
+            depth_slice.to_vec()
+        };
+
+        let quat = glam::Quat::from_xyzw(quat[0], quat[1], quat[2], quat[3]).normalize();
+        let translation = glam::Vec3::new(translation[0], translation[1], translation[2]);
+
+        let mut camera = self.unit_camera.clone();
+        camera.position = translation;
+        camera.rotation = quat;
+
+        let start = Instant::now();
+        self.rt_handle.block_on(async {
+            let error = self
+                .view_sender
+                .send(ViewData {
+                    frame_id,
+                    camera,
+                    image,
+                    depth,
+                    is_eval,
+                })
+                .await
+                .is_err();
+            if error {
+                return;
+            }
+            let error = self.done_receiver.recv().await.is_none();
+            if error {
+                return;
+            }
+        });
+        let add_splats_dur = start.elapsed();
+
+        if !is_eval {
+            log::info!("Adding view took: add splats: {:?}", add_splats_dur);
+        }
+    }
+
+    fn stop(&mut self) {
+        drop(mem::replace(&mut self.view_sender, mpsc::channel(1).0));
+    }
+
+    //fn new_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]) {
+    //    let quat = glam::Quat::from_xyzw(quat[0], quat[1], quat[2], quat[3]).normalize();
+    //    let translation = glam::Vec3::new(translation[0], translation[1], translation[2]);
+    //    self.pose_sender
+    //        .send(PoseData {
+    //            frame_id,
+    //            translation,
+    //            quat,
+    //        })
+    //        .unwrap();
+    //}
+
+    //fn update_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]) {
+    //    self.new_pose(frame_id, translation, quat);
+    //}
+
+    fn run(&mut self, with_ui: bool) -> anyhow::Result<()> {
+        if with_ui {
+            let process = create_incremental_training_process(
+                mem::take(&mut self.view_receiver).unwrap(),
+                mem::take(&mut self.done_sender).unwrap(),
+                self.config.clone(),
+            );
+
+            self.runtime.block_on(async move {
+                let logger = env_logger::Builder::from_default_env()
+                    .target(env_logger::Target::Stdout)
+                    .build();
+                let max = logger.filter();
+                brush_app::ui::log_panel::install_global_logger(Box::new(logger), max);
+
+                let native_options = eframe::NativeOptions {
+                    viewport: egui::ViewportBuilder::default()
+                        .with_inner_size(egui::Vec2::new(1450.0, 1200.0))
+                        .with_active(true),
+                    wgpu_options: brush_app::ui::create_egui_options(),
+                    persist_window: true,
+                    ..Default::default()
+                };
+
+                eframe::run_native(
+                    "Incremental Brush",
+                    native_options,
+                    Box::new(move |cc| Ok(Box::new(App::new(cc, Some(process))))),
+                )?;
+
+                Result::<(), anyhow::Error>::Ok(())
+            })?;
+        } else {
+            let _ =
+                env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+                    .target(env_logger::Target::Stdout)
+                    .try_init();
+
+            run_incremental_training_headless(
+                &self.runtime,
+                mem::take(&mut self.view_receiver).unwrap(),
+                mem::take(&mut self.done_sender).unwrap(),
+                self.config.clone(),
+            );
+        }
+
+        Ok(())
+    }
+
+    unsafe fn copy_into_rgba_image(&self, image_ptr: *const u16) -> DynamicImage {
         let pixel_count = (self.img_width * self.img_height) as usize;
         let mut rgba_bytes = Vec::with_capacity(pixel_count * 4);
 
@@ -133,76 +286,9 @@ impl BrushBridge {
             }
         }
 
-        let image = DynamicImage::ImageRgba8(
+        DynamicImage::ImageRgba8(
             image::RgbaImage::from_raw(self.img_width, self.img_height, rgba_bytes).unwrap(),
-        );
-
-        // TODO try to pass depth data as shared_ptr to avoid copy
-        let depth_slice = unsafe { std::slice::from_raw_parts(depth_ptr, pixel_count) };
-        let depth = depth_slice.to_vec();
-
-        self.image_sender
-            .send(ImageData {
-                frame_id,
-                image,
-                depth,
-            })
-            .unwrap();
-    }
-
-    fn new_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]) {
-        let quat = glam::Quat::from_xyzw(quat[0], quat[1], quat[2], quat[3]).normalize();
-        let translation = glam::Vec3::new(translation[0], translation[1], translation[2]);
-        self.pose_sender
-            .send(PoseData {
-                frame_id,
-                translation,
-                quat,
-            })
-            .unwrap();
-    }
-
-    fn update_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]) {
-        self.new_pose(frame_id, translation, quat);
-    }
-
-    fn run_ui(&mut self) -> anyhow::Result<()> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to initialize tokio runtime");
-
-        let process = create_incremental_training_process(
-            mem::take(&mut self.database).unwrap(),
-            self.config.clone(),
-        );
-
-        runtime.block_on(async move {
-            let logger = env_logger::Builder::from_default_env()
-                .target(env_logger::Target::Stdout)
-                .build();
-            let max = logger.filter();
-            brush_app::ui::log_panel::install_global_logger(Box::new(logger), max);
-
-            let native_options = eframe::NativeOptions {
-                viewport: egui::ViewportBuilder::default()
-                    .with_inner_size(egui::Vec2::new(1450.0, 1200.0))
-                    .with_active(true),
-                wgpu_options: brush_app::ui::create_egui_options(),
-                persist_window: true,
-                ..Default::default()
-            };
-
-            eframe::run_native(
-                "Incremental Brush",
-                native_options,
-                Box::new(move |cc| Ok(Box::new(App::new(cc, Some(process))))),
-            )?;
-
-            Result::<(), anyhow::Error>::Ok(())
-        })?;
-
-        Ok(())
+        )
     }
 }
 

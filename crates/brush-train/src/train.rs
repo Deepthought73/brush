@@ -11,6 +11,7 @@ use crate::{
 };
 use brush_dataset::scene::SceneBatch;
 use brush_loss::{ImageLossConfig, depth_loss, image_loss};
+use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{RasterPass, RasterizationMode, Splats};
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::render_splats_with_pass;
@@ -49,6 +50,44 @@ const MIN_SCALE_FREEZE_FRAC: f32 = 0.9;
 const MIN_SCALE_FACTOR: f32 = 0.1;
 
 type OptimizerType = OptimizerAdaptor<AdamScaled, Splats>;
+
+/// A `SceneBatch`'s ground truth already uploaded to the GPU, plus the cheap
+/// per-view metadata `step` needs. Cloning is cheap (tensor handles only), so
+/// building this once per view and reusing it across a burst of steps avoids
+/// re-uploading the same image (and depth) to the GPU on every step.
+#[derive(Clone)]
+pub struct GpuBatch {
+    /// Packed `[H, W]` u32 RGBA GT, on the inner (non-autodiff) backend.
+    gt_packed: Tensor<2, Int>,
+    /// Optional `[H, W]` f32 metric depth GT.
+    depth: Option<Tensor<2>>,
+    has_alpha: bool,
+    alpha_mode: AlphaMode,
+    camera: Camera,
+    img_h: usize,
+    img_w: usize,
+}
+
+impl GpuBatch {
+    /// Upload a `SceneBatch`'s GT (image + optional depth) to the GPU once.
+    pub fn from_scene_batch(batch: SceneBatch, device: &Device) -> Self {
+        let [img_h, img_w] = batch.img_size();
+        // Inner backend: the GT is pure data, never differentiated, and the
+        // LPIPS `unpack_gt_rgb` path expects a clean (non-autodiff) Wgpu tensor.
+        let gt_packed: Tensor<2, Int> =
+            Tensor::from_data(batch.img_packed, &device.clone().inner());
+        let depth = batch.depth.map(|d| Tensor::<2>::from_data(d, device));
+        Self {
+            gt_packed,
+            depth,
+            has_alpha: batch.has_alpha,
+            alpha_mode: batch.alpha_mode,
+            camera: batch.camera,
+            img_h,
+            img_w,
+        }
+    }
+}
 
 pub struct SplatTrainer {
     config: TrainConfig,
@@ -154,7 +193,21 @@ impl SplatTrainer {
         self.view_cams = view_cams;
     }
 
+    /// Upload a `SceneBatch`'s GT to the GPU, then take one step. Fine for
+    /// callers that step once per view; for a burst of steps on the *same*
+    /// view, build a [`GpuBatch`] once and call [`Self::step_prepared`] so the
+    /// image (and depth) aren't re-uploaded to the GPU every step.
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
+        let batch = GpuBatch::from_scene_batch(batch, &splats.device());
+        self.step_prepared(&batch, splats).await
+    }
+
+    /// Step against GT that's already resident on the GPU (see [`GpuBatch`]).
+    pub async fn step_prepared(
+        &mut self,
+        batch: &GpuBatch,
+        splats: Splats,
+    ) -> (Splats, TrainStepStats) {
         let mut splats = splats;
 
         // Track max SH degree from the first splats we see.
@@ -163,20 +216,17 @@ impl SplatTrainer {
         }
         self.step_count += 1;
 
-        let [img_h, img_w] = batch.img_size();
+        let (img_h, img_w) = (batch.img_h, batch.img_w);
         let camera = batch.camera;
 
         let device = splats.device();
         let has_alpha = batch.has_alpha;
-        // GT lives on the GPU as packed `[H, W]` u32 (RGBA u8). All mixing
-        // (bg compositing, alpha matching, mask) is folded into the loss
-        // kernels; no f32 GT image is ever materialised here.
-        // GT is pure data — never differentiated. Build it on the inner
-        // backend so it doesn't inherit the autodiff device's residual
-        // checkpointing flag (the LPIPS `unpack_gt_rgb` path, via
-        // `unwrap_wgpu_int`, expects a clean Wgpu tensor).
-        let gt_packed: Tensor<2, Int> =
-            Tensor::from_data(batch.img_packed, &device.clone().inner());
+        // GT was uploaded once in `GpuBatch::from_scene_batch` (packed
+        // `[H, W]` u32 RGBA on the inner backend, so it carries no autodiff
+        // checkpointing flag). All mixing (bg compositing, alpha matching,
+        // mask) is folded into the loss kernels; reuse it here with no
+        // per-step host→device copy.
+        let gt_packed = batch.gt_packed.clone();
         let img_size = glam::uvec2(img_w as u32, img_h as u32);
         let base = &self.config.background_color;
         let base_bg = glam::Vec3::new(base[0], base[1], base[2]);
@@ -267,8 +317,8 @@ impl SplatTrainer {
             }
 
             // Depth Disparity L1 loss on rendered expected depth
-            if use_depth && let Some(depth_data) = &batch.depth {
-                let gt_depth: Tensor<2> = Tensor::from_data(depth_data.clone(), &device);
+            if use_depth && let Some(gt_depth) = &batch.depth {
+                let gt_depth = gt_depth.clone();
                 let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
                 let alpha = pred_image.clone().slice(s![.., .., 3..4]);
                 let expected_depth =
