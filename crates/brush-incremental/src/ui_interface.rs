@@ -52,21 +52,23 @@ impl IncrementalTrainer {
     }
 
     pub fn update_up_axis(&mut self, camera: &Camera) {
-        let rot = glam::Mat3::from_quat(camera.rotation);
-        if self.up_axis.is_none() {
-            self.up_axis = Some(rot.y_axis);
-        } else if let Some(up_axis) = self.up_axis.as_mut() {
-            *up_axis *= self.up_axis_factor_count;
-            *up_axis += rot.y_axis;
-            *up_axis = up_axis.normalize();
+        if self.emitter.is_some() && self.train_views.len() + self.eval_views.len() < 50 {
+            let rot = glam::Mat3::from_quat(camera.rotation);
+            if self.up_axis.is_none() {
+                self.up_axis = Some(rot.y_axis);
+            } else if let Some(up_axis) = self.up_axis.as_mut() {
+                *up_axis *= self.up_axis_factor_count;
+                *up_axis += rot.y_axis;
+                *up_axis = up_axis.normalize();
+            }
+            self.up_axis_factor_count += 1.;
         }
-        self.up_axis_factor_count += 1.;
     }
 
     pub async fn update_ui_dataset(&self) {
         if let Some(emitter) = &self.emitter {
-            let train_views = collect_scene_views(&self.train_views);
-            let eval_views = collect_scene_views(&self.eval_views);
+            let train_views = collect_scene_views(self.train_views.values());
+            let eval_views = collect_scene_views(self.eval_views.values());
 
             emitter
                 .emit(ProcessMessage::TrainMessage(TrainMessage::Dataset {
@@ -102,9 +104,8 @@ impl IncrementalTrainer {
     }
 }
 
-fn collect_scene_views(views: &[ViewData]) -> Vec<SceneView> {
+fn collect_scene_views<'a>(views: impl Iterator<Item = &'a ViewData>) -> Vec<SceneView> {
     views
-        .iter()
         .map(|view| {
             let img_path = PathBuf::from(&format!("{}.png", view.frame_id));
             SceneView {

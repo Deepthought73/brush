@@ -23,7 +23,7 @@ const TRAINER_BOUNDING_BOX: BoundingBox = BoundingBox {
 };
 
 impl IncrementalTrainer {
-    pub async fn add_gaussians_from_view(&mut self, view: &ViewData) {
+    pub async fn add_host_view(&mut self, view: &ViewData) {
         let w = view.image.width() as usize;
         let h = view.image.height() as usize;
         let mut added_depth_values = vec![false; w * h];

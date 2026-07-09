@@ -1,8 +1,10 @@
 use crate::ffi::CameraModelId;
 use brush_app::ui::app::App;
+use brush_incremental::IncrementalTrainMessage::{ContinueTrain, NewView};
 use brush_incremental::config::IncrementalTrainConfig;
 use brush_incremental::{
-    ViewData, create_incremental_training_process, run_incremental_training_headless,
+    IncrementalTrainMessage, ViewData, create_incremental_training_process,
+    run_incremental_training_headless,
 };
 use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
@@ -45,7 +47,10 @@ mod ffi {
             translation: [f32; 3],
             quat: [f32; 4],
             is_eval: bool,
+            is_host_frame: bool,
         );
+
+        fn continue_train(&mut self);
 
         fn stop(&mut self);
 
@@ -59,8 +64,8 @@ mod ffi {
 struct BrushBridge {
     config: IncrementalTrainConfig,
 
-    view_sender: mpsc::Sender<ViewData>,
-    view_receiver: Option<mpsc::Receiver<ViewData>>,
+    message_sender: mpsc::Sender<IncrementalTrainMessage>,
+    message_receiver: Option<mpsc::Receiver<IncrementalTrainMessage>>,
     done_sender: Option<mpsc::Sender<()>>,
     done_receiver: mpsc::Receiver<()>,
 
@@ -88,7 +93,7 @@ fn create_brush_bridge(
         .expect("Failed to initialize tokio runtime");
     let rt_handle = runtime.handle().clone();
 
-    let (view_sender, view_receiver) = mpsc::channel::<ViewData>(1);
+    let (message_sender, message_receiver) = mpsc::channel::<IncrementalTrainMessage>(1);
     let (done_sender, done_receiver) = mpsc::channel::<()>(1);
 
     let config = get_config(config_path);
@@ -129,8 +134,8 @@ fn create_brush_bridge(
 
     BrushBridge {
         config,
-        view_sender,
-        view_receiver: Some(view_receiver),
+        message_sender,
+        message_receiver: Some(message_receiver),
         done_sender: Some(done_sender),
         done_receiver,
         unit_camera,
@@ -152,6 +157,7 @@ impl BrushBridge {
         translation: [f32; 3],
         quat: [f32; 4],
         is_eval: bool,
+        is_host_frame: bool,
     ) {
         let image = unsafe { self.copy_into_rgba_image(image_ptr) };
 
@@ -174,14 +180,15 @@ impl BrushBridge {
         let start = Instant::now();
         self.rt_handle.block_on(async {
             let error = self
-                .view_sender
-                .send(ViewData {
+                .message_sender
+                .send(NewView(ViewData {
                     frame_id,
                     camera,
                     image,
                     depth,
                     is_eval,
-                })
+                    is_host_frame,
+                }))
                 .await
                 .is_err();
             if error {
@@ -199,8 +206,21 @@ impl BrushBridge {
         }
     }
 
+    fn continue_train(&mut self) {
+        self.rt_handle.block_on(async {
+            let error = self.message_sender.send(ContinueTrain).await.is_err();
+            if error {
+                return;
+            }
+            let error = self.done_receiver.recv().await.is_none();
+            if error {
+                return;
+            }
+        });
+    }
+
     fn stop(&mut self) {
-        drop(mem::replace(&mut self.view_sender, mpsc::channel(1).0));
+        drop(mem::replace(&mut self.message_sender, mpsc::channel(1).0));
     }
 
     //fn new_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]) {
@@ -222,7 +242,7 @@ impl BrushBridge {
     fn run(&mut self, with_ui: bool) -> anyhow::Result<()> {
         if with_ui {
             let process = create_incremental_training_process(
-                mem::take(&mut self.view_receiver).unwrap(),
+                mem::take(&mut self.message_receiver).unwrap(),
                 mem::take(&mut self.done_sender).unwrap(),
                 self.config.clone(),
             );
@@ -259,7 +279,7 @@ impl BrushBridge {
 
             run_incremental_training_headless(
                 &self.runtime,
-                mem::take(&mut self.view_receiver).unwrap(),
+                mem::take(&mut self.message_receiver).unwrap(),
                 mem::take(&mut self.done_sender).unwrap(),
                 self.config.clone(),
             );

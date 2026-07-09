@@ -1,4 +1,7 @@
+use crate::IncrementalTrainMessage::NewView;
 use crate::config::IncrementalTrainConfig;
+use crate::view_sampling::{ViewSampler, create_view_sampler};
+use IncrementalTrainMessage::ContinueTrain;
 use anyhow::Context;
 use async_fn_stream::{TryStreamEmitter, try_fn_stream};
 use brush_process::message::{ProcessMessage, TrainMessage};
@@ -7,17 +10,26 @@ use brush_process::{RunningProcess, slot, wait_for_device};
 use brush_render::{AlphaMode, camera::Camera, gaussian_splats::Splats};
 use brush_train::eval::eval_stats;
 use image::DynamicImage;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+mod add_host_view;
+mod all_view_training;
 pub mod config;
-mod landmark_householding;
 mod ui_interface;
+mod view_sampling;
 
 pub type FrameId = u64;
+
+pub enum IncrementalTrainMessage {
+    NewView(ViewData),
+    ContinueTrain,
+}
 
 pub struct ViewData {
     pub frame_id: FrameId,
@@ -25,6 +37,7 @@ pub struct ViewData {
     pub image: DynamicImage,
     pub depth: Vec<f32>,
     pub is_eval: bool,
+    pub is_host_frame: bool,
 }
 
 impl ViewData {
@@ -34,7 +47,7 @@ impl ViewData {
 }
 
 pub fn create_incremental_training_process(
-    view_receiver: mpsc::Receiver<ViewData>,
+    message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
     done_sender: mpsc::Sender<()>,
     config: IncrementalTrainConfig,
 ) -> RunningProcess {
@@ -42,7 +55,7 @@ pub fn create_incremental_training_process(
 
     let stream = try_fn_stream(|emitter| async move {
         let mut train_ctx = IncrementalTrainer::new(
-            view_receiver,
+            message_receiver,
             done_sender,
             Some(splat_tx),
             Some(emitter),
@@ -61,7 +74,7 @@ pub fn create_incremental_training_process(
 
 pub fn run_incremental_training_headless(
     runtime: &Runtime,
-    view_receiver: mpsc::Receiver<ViewData>,
+    message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
     done_sender: mpsc::Sender<()>,
     config: IncrementalTrainConfig,
 ) {
@@ -69,18 +82,21 @@ pub fn run_incremental_training_headless(
         brush_process::burn_init_setup().await;
 
         let mut train_ctx =
-            IncrementalTrainer::new(view_receiver, done_sender, None, None, config).await;
+            IncrementalTrainer::new(message_receiver, done_sender, None, None, config).await;
 
         train_ctx.run_train_loop().await
     });
 }
 
 pub struct IncrementalTrainer {
-    view_receiver: mpsc::Receiver<ViewData>,
+    message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
     done_sender: mpsc::Sender<()>,
 
-    train_views: Vec<ViewData>,
-    eval_views: Vec<ViewData>,
+    train_views: HashMap<FrameId, ViewData>,
+    eval_views: HashMap<FrameId, ViewData>,
+
+    view_sampler: Box<dyn ViewSampler>,
+    rng: StdRng,
 
     training_start: Option<Instant>,
     splats: Option<Splats>,
@@ -100,7 +116,7 @@ pub struct IncrementalTrainer {
 
 impl IncrementalTrainer {
     async fn new(
-        view_receiver: mpsc::Receiver<ViewData>,
+        message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
         done_sender: mpsc::Sender<()>,
         splat_sender: Option<SlotSender<Splats>>,
         emitter: Option<TryStreamEmitter<ProcessMessage, anyhow::Error>>,
@@ -109,11 +125,16 @@ impl IncrementalTrainer {
         let device: burn::tensor::Device = wait_for_device().await.clone().into();
         device.seed(config.seed);
 
+        let view_sampler =
+            create_view_sampler(&config.all_view_train_config.view_sampling_strategy);
+
+        let rng = StdRng::from_seed([config.seed as u8; 32]);
+
         Self {
-            view_receiver,
+            message_receiver,
             done_sender,
-            train_views: vec![],
-            eval_views: vec![],
+            train_views: Default::default(),
+            eval_views: Default::default(),
             splat_sender,
             splats: None,
             training_start: None,
@@ -124,6 +145,8 @@ impl IncrementalTrainer {
             up_axis: None,
             splat_sender_initialized: false,
             up_axis_factor_count: 0.0,
+            view_sampler,
+            rng,
         }
     }
 
@@ -133,32 +156,32 @@ impl IncrementalTrainer {
         let mut eval_count = 0.0;
 
         loop {
-            let view_data = self.view_receiver.recv().await;
+            match self.message_receiver.recv().await {
+                Some(message) => match message {
+                    NewView(view_data) => {
+                        self.update_up_axis(&view_data.camera);
 
-            let view_data = if let Some(view_data) = view_data {
-                view_data
-            } else {
-                break;
-            };
+                        if view_data.is_eval {
+                            self.eval_views.insert(view_data.frame_id, view_data);
+                        } else {
+                            if view_data.is_host_frame {
+                                self.add_host_view(&view_data).await;
+                            }
 
-            if self.training_start.is_none() {
-                self.training_start = Some(Instant::now());
+                            self.view_sampler.added_new_view(view_data.frame_id);
+                            self.train_views.insert(view_data.frame_id, view_data);
+                        }
+                    }
+                    ContinueTrain => {}
+                },
+                None => break,
             }
 
             let training_secs = self.training_secs();
 
             // TODO self.update_poses().await;
 
-            if self.emitter.is_some() && self.train_views.len() + self.eval_views.len() < 50 {
-                self.update_up_axis(&view_data.camera);
-            }
-
-            if view_data.is_eval {
-                self.eval_views.push(view_data);
-            } else {
-                self.add_gaussians_from_view(&view_data).await;
-                self.train_views.push(view_data);
-            }
+            self.train().await;
 
             if let Some(eval_every) = self.config.eval_every_sec
                 && training_secs >= eval_every * eval_count
@@ -190,23 +213,23 @@ impl IncrementalTrainer {
         Ok(())
     }
 
-    async fn eval(&self, eval_all_views: bool) -> anyhow::Result<()> {
+    async fn eval(&self, eval_train: bool) -> anyhow::Result<()> {
         if let Some(splats) = self.splats.clone() {
             let mut psnr_sum = 0.;
             let mut ssim_sum = 0.;
 
-            let extra_views: &[ViewData] = if eval_all_views {
-                &self.train_views
+            let views = if eval_train {
+                self.train_views.values()
             } else {
-                &[]
+                self.eval_views.values()
             };
-            let num_views = self.eval_views.len() + extra_views.len();
+            let num_views = views.len();
 
             if num_views == 0 {
                 return Ok(());
             }
 
-            for view in self.eval_views.iter().chain(extra_views.iter()) {
+            for view in views {
                 let eval_result = eval_stats(
                     splats.clone(),
                     &view.camera,
@@ -265,8 +288,8 @@ impl IncrementalTrainer {
         Ok(())
     }
 
-    fn training_secs(&self) -> f64 {
-        self.training_start
-            .map_or(0.0, |it| it.elapsed().as_secs_f64())
+    fn training_secs(&mut self) -> f64 {
+        let training_start = self.training_start.get_or_insert(Instant::now());
+        training_start.elapsed().as_secs_f64()
     }
 }

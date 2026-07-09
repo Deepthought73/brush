@@ -1,5 +1,4 @@
 use brush_render::gaussian_splats::SplatRenderMode;
-use brush_train::config::TrainConfig;
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +62,10 @@ pub struct IncrementalTrainConfig {
     #[arg(skip)]
     #[serde(default)]
     pub single_view_train_config: SingleViewTrainConfig,
+
+    #[arg(skip)]
+    #[serde(default)]
+    pub all_view_train_config: AllViewTrainConfig,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -85,6 +88,30 @@ pub struct SingleViewTrainConfig {
     pub ssim_weight: f32,
     pub anti_needle_loss_weight: f32,
     pub depth_loss_weight: f32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AllViewTrainConfig {
+    pub view_sampling_strategy: String,
+    pub steps: u32,
+    pub lr_mean: f64,
+    pub ssim_weight: f32,
+    pub anti_needle_loss_weight: f32,
+    pub depth_loss_weight: f32,
+}
+
+impl Default for AllViewTrainConfig {
+    fn default() -> Self {
+        Self {
+            view_sampling_strategy: "random".to_string(),
+            steps: 20,
+            lr_mean: 2e-5,
+            ssim_weight: 0.2,
+            anti_needle_loss_weight: 0.05,
+            depth_loss_weight: 0.1,
+        }
+    }
 }
 
 impl Default for IncrementalTrainConfig {
