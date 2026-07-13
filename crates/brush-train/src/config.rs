@@ -43,7 +43,7 @@ pub struct TrainConfig {
     /// Learning rate for the rotation parameters.
     #[arg(long, help_heading = "Training options", default_value = "2e-3")]
     pub lr_rotation: f64,
-    
+
     /// Jointly optimize the camera poses (extrinsics) alongside the splats.
     /// Each training view gets a learnable SE(3) correction, refined from the
     /// same gradient stream as the splats (see `pose_opt` module).

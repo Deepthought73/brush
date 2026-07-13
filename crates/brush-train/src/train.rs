@@ -1,6 +1,6 @@
 use std::f32::consts::FRAC_1_SQRT_2;
 
-use crate::pose_optimization::{PoseDeltaMagnitudes, PoseOptimizer};
+use crate::pose_optimization::PoseOptimizer;
 use crate::{
     adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
     config::TrainConfig,

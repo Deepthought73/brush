@@ -21,13 +21,15 @@ use tokio::sync::mpsc;
 mod add_host_view;
 mod all_view_training;
 pub mod config;
+mod pose_update;
 mod ui_interface;
 mod view_sampling;
 
-pub type FrameId = u64;
+pub type FrameId = i64;
 
 pub enum IncrementalTrainMessage {
     NewView(ViewData),
+    ExternalPoseUpdate(Vec<(FrameId, glam::Vec3, glam::Quat)>),
     ContinueTrain,
 }
 
@@ -92,7 +94,8 @@ pub struct IncrementalTrainer {
     message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
     done_sender: mpsc::Sender<()>,
 
-    frame_id_to_idx: HashMap<FrameId, usize>,
+    train_frame_id_to_idx: HashMap<FrameId, usize>,
+    eval_frame_id_to_idx: HashMap<FrameId, usize>,
     train_views: Vec<ViewData>,
     eval_views: Vec<ViewData>,
 
@@ -133,7 +136,8 @@ impl IncrementalTrainer {
         Self {
             message_receiver,
             done_sender,
-            frame_id_to_idx: Default::default(),
+            train_frame_id_to_idx: Default::default(),
+            eval_frame_id_to_idx: Default::default(),
             train_views: Default::default(),
             eval_views: Default::default(),
             splat_sender,
@@ -163,14 +167,16 @@ impl IncrementalTrainer {
                         self.update_up_axis(&view_data.camera);
                         self.add_view(view_data).await;
                     }
+                    IncrementalTrainMessage::ExternalPoseUpdate(new_poses) => {
+                        self.update_poses(new_poses).await;
+                        continue;
+                    }
                     ContinueTrain => {}
                 },
                 None => break,
             }
 
             let training_secs = self.training_secs();
-
-            // TODO self.update_poses().await;
 
             self.train().await;
 
@@ -204,10 +210,12 @@ impl IncrementalTrainer {
 
     async fn add_view(&mut self, view_data: ViewData) {
         if view_data.is_eval {
+            self.eval_frame_id_to_idx
+                .insert(view_data.frame_id, self.eval_views.len());
             self.eval_views.push(view_data);
         } else {
             self.view_sampler.added_new_view(self.train_views.len());
-            self.frame_id_to_idx
+            self.train_frame_id_to_idx
                 .insert(view_data.frame_id, self.train_views.len());
             if view_data.is_host_frame {
                 self.add_host_view(&view_data).await;

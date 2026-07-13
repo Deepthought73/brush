@@ -40,19 +40,6 @@ pub struct PoseParams {
     deltas: Param<Tensor<2>>,
 }
 
-/// Summary of the current pose-correction magnitudes (how far the poses have
-/// moved from their originals). Rotation is the axis-angle length in radians,
-/// translation is the offset length in world units — kept separate because
-/// they have different units. When these plateau over training, the poses have
-/// converged.
-#[derive(Clone, Copy, Debug)]
-pub struct PoseDeltaMagnitudes {
-    pub rot_mean: f32,
-    pub rot_max: f32,
-    pub trans_mean: f32,
-    pub trans_max: f32,
-}
-
 /// Owns the pose corrections plus their optimizer and LR schedule.
 pub struct PoseOptimizer {
     params: PoseParams,
@@ -85,12 +72,14 @@ fn quat_mul(a: Tensor<2>, b: Tensor<2>) -> Tensor<2> {
     let by = b.clone().slice(s![.., 2..3]);
     let bz = b.slice(s![.., 3..4]);
 
-    let w = aw.clone() * bw.clone() - ax.clone() * bx.clone() - ay.clone() * by.clone()
+    let w = aw.clone() * bw.clone()
+        - ax.clone() * bx.clone()
+        - ay.clone() * by.clone()
         - az.clone() * bz.clone();
-    let x =
-        aw.clone() * bx.clone() + ax.clone() * bw.clone() + ay.clone() * bz.clone()
-            - az.clone() * by.clone();
-    let y = aw.clone() * by.clone() - ax.clone() * bz.clone() + ay.clone() * bw.clone()
+    let x = aw.clone() * bx.clone() + ax.clone() * bw.clone() + ay.clone() * bz.clone()
+        - az.clone() * by.clone();
+    let y = aw.clone() * by.clone() - ax.clone() * bz.clone()
+        + ay.clone() * bw.clone()
         + az.clone() * bx.clone();
     let z = aw * bz + ax * by - ay * bx + az * bw;
     Tensor::cat(vec![w, x, y, z], 1)
@@ -131,7 +120,12 @@ impl PoseOptimizer {
     /// transforms tensor (means(3) + quat(4, `wxyz`) + log-scales(3)). Rotation
     /// is applied about `cam_pos` so it stays decoupled from translation.
     /// Differentiable w.r.t. both the transforms and the pose deltas.
-    pub fn apply(&self, transforms: Tensor<2>, view_index: usize, cam_pos: glam::Vec3) -> Tensor<2> {
+    pub fn apply(
+        &self,
+        transforms: Tensor<2>,
+        view_index: usize,
+        cam_pos: glam::Vec3,
+    ) -> Tensor<2> {
         let device = transforms.device();
         let n = transforms.dims()[0];
 
@@ -148,7 +142,8 @@ impl PoseOptimizer {
         let quats = transforms.clone().slice(s![.., 3..7]); // [N,4]
         let scales = transforms.slice(s![.., 7..10]); // [N,3]
 
-        let cam = Tensor::<1>::from_floats([cam_pos.x, cam_pos.y, cam_pos.z], &device).reshape([1, 3]);
+        let cam =
+            Tensor::<1>::from_floats([cam_pos.x, cam_pos.y, cam_pos.z], &device).reshape([1, 3]);
         let means_c = means - cam.clone(); // [N,3]
         let qd_n = qd.clone().repeat_dim(0, n); // [N,4]
         let means_rot = quaternion_vec_multiply(qd_n, means_c); // [N,3]
@@ -168,48 +163,6 @@ impl PoseOptimizer {
         // consumes and returns the module like the splat optimizer does.
         self.params = self.optim.step(lr, self.params.clone(), grad);
         lr
-    }
-
-    /// Read the pose deltas back to the CPU and summarize their magnitude
-    /// (mean/max rotation in radians and translation in world units). Use this
-    /// to track whether the poses have converged (magnitudes stop changing).
-    pub async fn delta_magnitudes(&self) -> PoseDeltaMagnitudes {
-        let data: Vec<f32> = self
-            .params
-            .deltas
-            .val()
-            .inner()
-            .into_data_async()
-            .await
-            .expect("read pose deltas")
-            .into_vec()
-            .expect("pose deltas are f32");
-
-        let n = data.len() / 6;
-        let mut rot_sum = 0.0f32;
-        let mut rot_max = 0.0f32;
-        let mut trans_sum = 0.0f32;
-        let mut trans_max = 0.0f32;
-        for i in 0..n {
-            let o = i * 6;
-            let rot = (data[o] * data[o] + data[o + 1] * data[o + 1] + data[o + 2] * data[o + 2])
-                .sqrt();
-            let trans = (data[o + 3] * data[o + 3]
-                + data[o + 4] * data[o + 4]
-                + data[o + 5] * data[o + 5])
-                .sqrt();
-            rot_sum += rot;
-            rot_max = rot_max.max(rot);
-            trans_sum += trans;
-            trans_max = trans_max.max(trans);
-        }
-        let inv = if n > 0 { 1.0 / n as f32 } else { 0.0 };
-        PoseDeltaMagnitudes {
-            rot_mean: rot_sum * inv,
-            rot_max,
-            trans_mean: trans_sum * inv,
-            trans_max,
-        }
     }
 
     /// Read the current per-view corrections back to the CPU and apply them to
@@ -288,8 +241,7 @@ mod tests {
     async fn zero_delta_is_identity() {
         // Poses live on the autodiff device, so the transforms we feed `apply`
         // must too (backends must match).
-        let device: Device =
-            Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let device: Device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
         let cfg = TrainConfig::default();
         let opt = PoseOptimizer::new(2, &cfg, &device);
         let transforms = sample_transforms(&device);
@@ -300,8 +252,7 @@ mod tests {
 
     #[wasm_bindgen_test(unsupported = tokio::test)]
     async fn pure_translation_shifts_means_only() {
-        let device: Device =
-            Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let device: Device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
         let cfg = TrainConfig::default();
         let mut opt = PoseOptimizer::new(1, &cfg, &device);
         // Translation-only delta: (+0.1, +0.2, -0.3) on the last three columns.
@@ -323,8 +274,7 @@ mod tests {
         // The whole point of approach B: a downstream loss on the corrected
         // transforms must produce a finite, non-zero gradient on the pose delta.
         // Backward needs an autodiff-enabled device.
-        let device: Device =
-            Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+        let device: Device = Device::from(brush_cube::test_helpers::test_device().await).autodiff();
         let cfg = TrainConfig::default();
         let mut opt = PoseOptimizer::new(1, &cfg, &device);
         let d = Tensor::<2>::zeros([1, 6], &device).require_grad();
@@ -340,8 +290,19 @@ mod tests {
             .deltas
             .grad(&grads)
             .expect("pose delta must receive a gradient");
-        let g: Vec<f32> = g.into_data_async().await.expect("readback").into_vec().expect("f32");
-        assert!(g.iter().all(|v| v.is_finite()), "grad must be finite: {g:?}");
-        assert!(g.iter().any(|v| v.abs() > 1e-6), "grad must be non-zero: {g:?}");
+        let g: Vec<f32> = g
+            .into_data_async()
+            .await
+            .expect("readback")
+            .into_vec()
+            .expect("f32");
+        assert!(
+            g.iter().all(|v| v.is_finite()),
+            "grad must be finite: {g:?}"
+        );
+        assert!(
+            g.iter().any(|v| v.abs() > 1e-6),
+            "grad must be non-zero: {g:?}"
+        );
     }
 }

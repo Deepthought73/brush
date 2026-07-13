@@ -1,6 +1,6 @@
-use crate::ffi::CameraModelId;
+use crate::ffi::{CameraModelId, StampedPose};
 use brush_app::ui::app::App;
-use brush_incremental::IncrementalTrainMessage::{ContinueTrain, NewView};
+use brush_incremental::IncrementalTrainMessage::{ContinueTrain, ExternalPoseUpdate, NewView};
 use brush_incremental::config::IncrementalProcessConfig;
 use brush_incremental::{
     IncrementalTrainMessage, ViewData, create_incremental_training_process,
@@ -27,6 +27,13 @@ mod ffi {
     }
 
     #[namespace = "brush_cxx_bridge"]
+    struct StampedPose {
+        frame_id: i64,
+        t: [f32; 3],
+        q: [f32; 4],
+    }
+
+    #[namespace = "brush_cxx_bridge"]
     extern "Rust" {
         type BrushBridge;
 
@@ -41,7 +48,7 @@ mod ffi {
 
         unsafe fn add_view_to_splat(
             &mut self,
-            frame_id: u64,
+            frame_id: i64,
             image_ptr: *const u16,
             depth_ptr: *const f32,
             translation: [f32; 3],
@@ -52,10 +59,9 @@ mod ffi {
 
         fn continue_train(&mut self);
 
-        fn stop(&mut self);
+        fn update_poses(&mut self, new_poses: Vec<StampedPose>);
 
-        // fn new_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]);
-        // fn update_pose(&self, frame_id: u64, translation: [f32; 3], quat: [f32; 4]);
+        fn stop(&mut self);
 
         fn run(&mut self, with_ui: bool) -> Result<()>;
     }
@@ -151,7 +157,7 @@ fn create_brush_bridge(
 impl BrushBridge {
     fn add_view_to_splat(
         &mut self,
-        frame_id: u64,
+        frame_id: i64,
         image_ptr: *const u16,
         depth_ptr: *const f32,
         translation: [f32; 3],
@@ -213,6 +219,29 @@ impl BrushBridge {
                 return;
             }
             let error = self.done_receiver.recv().await.is_none();
+            if error {
+                return;
+            }
+        });
+    }
+
+    fn update_poses(&mut self, new_poses: Vec<StampedPose>) {
+        self.rt_handle.block_on(async {
+            let new_poses = new_poses
+                .into_iter()
+                .map(|sp| {
+                    (
+                        sp.frame_id,
+                        glam::Vec3::new(sp.t[0], sp.t[1], sp.t[2]),
+                        glam::Quat::from_xyzw(sp.q[0], sp.q[1], sp.q[2], sp.q[3]).normalize(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let error = self
+                .message_sender
+                .send(ExternalPoseUpdate(new_poses))
+                .await
+                .is_err();
             if error {
                 return;
             }

@@ -65,7 +65,6 @@ pub struct IncrementalProcessConfig {
     #[arg(skip)]
     #[serde(default)]
     pub train_config: IncrementalTrainConfig,
-
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]

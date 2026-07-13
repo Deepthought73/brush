@@ -1,12 +1,17 @@
 use crate::IncrementalTrainer;
 use brush_dataset::scene::{SceneBatch, sample_to_packed_data_without_copy};
 use brush_render::AlphaMode;
+use brush_render::bounding_box::BoundingBox;
 use brush_train::config::TrainConfig;
-use brush_train::train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds};
+use brush_train::train::SplatTrainer;
 use burn::module::AutodiffModule;
 use burn::tensor::TensorData;
-use image::GenericImageView;
 use std::time::Instant;
+
+const TRAINER_BOUNDING_BOX: BoundingBox = BoundingBox {
+    center: glam::Vec3::ZERO,
+    extent: glam::Vec3::new(2.5, 1.5, 1.0),
+};
 
 impl IncrementalTrainer {
     pub async fn train(&mut self) {
@@ -15,15 +20,13 @@ impl IncrementalTrainer {
         }
 
         let start = Instant::now();
-        let mut splats = self.splats.clone().unwrap();
-        let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
 
         let config = self.create_all_view_train_config();
-        let mut trainer = SplatTrainer::new(&config, &self.device, bounds);
+        let mut trainer = SplatTrainer::new(&config, &self.device, TRAINER_BOUNDING_BOX);
         trainer.enable_pose_opt(self.train_views.len(), &self.device);
-        let trainer_init_dur = start.elapsed();
 
-        let start = Instant::now();
+        let mut splats = self.splats.clone().unwrap();
+
         for _ in 0..config.total_train_iters {
             let batch = self.get_next_train_batch();
 
@@ -31,9 +34,10 @@ impl IncrementalTrainer {
             let (new_diff, _stats) = trainer.step(batch, diff_splats).await;
             splats = new_diff.valid();
         }
+
         let train_dur = start.elapsed();
 
-        log::info!("Trainer init: {trainer_init_dur:?}, Train dur: {train_dur:?}");
+        log::info!("Train dur: {train_dur:?}");
 
         // Fold the learned per-view pose corrections back into the stored CPU
         // cameras so they persist. `base` must be in training-view order, which

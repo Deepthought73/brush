@@ -293,77 +293,13 @@ impl IncrementalTrainer {
         });
     }
 
-    /* TODO
-    async fn update_poses(&mut self) {
-        let start = Instant::now();
-
-        let pose_updates = self.database.collect_pose_updates();
-
-        if pose_updates.is_empty() {
-            return;
-        }
-
-        let updates: Vec<(glam::Vec3, glam::Quat, usize, usize)> = pose_updates
-            .into_iter()
-            .map(|(frame_id, delta_d, delta_q)| {
-                let (start, end) = self.corresponding_splats.get(&frame_id).unwrap();
-                (delta_d, delta_q, *start, *end)
-            })
-            .collect();
-
-        let Some(splats) = self.splats.as_mut() else {
-            return;
-        };
-
-        let id = splats.transforms.id;
-        let device = splats.transforms.device();
-        let dims = splats.transforms.dims();
-        let mut data = splats
-            .transforms
-            .val()
-            .into_data_async()
-            .await
-            .expect("failed to read splat transforms")
-            .into_vec::<f32>()
-            .expect("transforms tensor should be f32");
-
-        for (delta_d, delta_q, start, end) in updates {
-            for i in start..end {
-                let base = i * 10;
-
-                let mean = glam::Vec3::new(data[base], data[base + 1], data[base + 2]);
-                let mean = delta_q * mean + delta_d;
-                data[base] = mean.x;
-                data[base + 1] = mean.y;
-                data[base + 2] = mean.z;
-
-                let q = glam::Quat::from_xyzw(
-                    data[base + 4],
-                    data[base + 5],
-                    data[base + 6],
-                    data[base + 3],
-                );
-                let q = (delta_q * q).normalize();
-                data[base + 3] = q.w;
-                data[base + 4] = q.x;
-                data[base + 5] = q.y;
-                data[base + 6] = q.z;
-            }
-        }
-
-        let transforms = Tensor::from_data(TensorData::new(data, dims), &device);
-        splats.transforms = Param::initialized(id, transforms.detach().require_grad());
-
-        log::info!("Updating poses took {:?}", start.elapsed());
-    }*/
-
     fn build_scene_batch(&self, view: &ViewData) -> SceneBatch {
         let (img_packed, has_alpha) = sample_to_packed_data_without_copy(&view.image);
         let depth_tensor = TensorData::new(
             view.depth.to_vec(),
             [view.image.height(), view.image.width()],
         );
-        let view_index = self.frame_id_to_idx[&view.frame_id];
+        let view_index = self.train_frame_id_to_idx[&view.frame_id];
         SceneBatch {
             img_packed,
             has_alpha,
