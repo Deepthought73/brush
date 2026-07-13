@@ -67,8 +67,8 @@ impl IncrementalTrainer {
 
     pub async fn update_ui_dataset(&self) {
         if let Some(emitter) = &self.emitter {
-            let train_views = collect_scene_views(self.train_views.values());
-            let eval_views = collect_scene_views(self.eval_views.values());
+            let train_views = collect_scene_views(self.train_views.iter());
+            let eval_views = collect_scene_views(self.eval_views.iter());
 
             emitter
                 .emit(ProcessMessage::TrainMessage(TrainMessage::Dataset {

@@ -1,4 +1,3 @@
-use crate::FrameId;
 use rand::RngExt;
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
@@ -24,12 +23,12 @@ pub fn create_view_sampler(view_sampling_strategy: &str) -> Box<dyn ViewSampler>
 }
 
 pub trait ViewSampler: Send + Sync {
-    fn sample(&mut self, rng: &mut StdRng) -> FrameId;
-    fn added_new_view(&mut self, frame_id: FrameId);
+    fn sample(&mut self, rng: &mut StdRng) -> usize;
+    fn added_new_view(&mut self, frame_id: usize);
 }
 
 pub struct RandomViewSampler {
-    frame_ids: Vec<FrameId>,
+    frame_ids: Vec<usize>,
 }
 
 impl RandomViewSampler {
@@ -39,18 +38,18 @@ impl RandomViewSampler {
 }
 
 impl ViewSampler for RandomViewSampler {
-    fn sample(&mut self, rng: &mut StdRng) -> FrameId {
+    fn sample(&mut self, rng: &mut StdRng) -> usize {
         *self.frame_ids.choose(rng).unwrap()
     }
 
-    fn added_new_view(&mut self, frame_id: FrameId) {
+    fn added_new_view(&mut self, frame_id: usize) {
         self.frame_ids.push(frame_id);
     }
 }
 
 pub struct TrainFrequencyWeightedViewSampler {
     sampling_counts: Vec<f64>,
-    frame_ids: Vec<FrameId>,
+    frame_ids: Vec<usize>,
     dist: Option<WeightedIndex<f64>>,
 }
 
@@ -65,7 +64,7 @@ impl TrainFrequencyWeightedViewSampler {
 }
 
 impl ViewSampler for TrainFrequencyWeightedViewSampler {
-    fn sample(&mut self, rng: &mut StdRng) -> FrameId {
+    fn sample(&mut self, rng: &mut StdRng) -> usize {
         let dist = self.dist.as_mut().unwrap();
         let idx = dist.sample(rng);
 
@@ -76,7 +75,7 @@ impl ViewSampler for TrainFrequencyWeightedViewSampler {
         self.frame_ids[idx]
     }
 
-    fn added_new_view(&mut self, frame_id: FrameId) {
+    fn added_new_view(&mut self, frame_id: usize) {
         self.sampling_counts.push(0.);
         self.frame_ids.push(frame_id);
 
@@ -90,7 +89,7 @@ impl ViewSampler for TrainFrequencyWeightedViewSampler {
 }
 
 pub struct SlidingWindowViewSampler {
-    frame_ids: Vec<FrameId>,
+    frame_ids: Vec<usize>,
     window_size: usize,
 }
 
@@ -104,13 +103,13 @@ impl SlidingWindowViewSampler {
 }
 
 impl ViewSampler for SlidingWindowViewSampler {
-    fn sample(&mut self, rng: &mut StdRng) -> FrameId {
+    fn sample(&mut self, rng: &mut StdRng) -> usize {
         let count = self.frame_ids.len();
         let idx = rng.random_range(count.saturating_sub(self.window_size)..count);
         self.frame_ids[idx]
     }
 
-    fn added_new_view(&mut self, frame_id: FrameId) {
+    fn added_new_view(&mut self, frame_id: usize) {
         self.frame_ids.push(frame_id);
     }
 }

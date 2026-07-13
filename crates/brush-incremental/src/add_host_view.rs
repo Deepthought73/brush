@@ -49,7 +49,7 @@ impl IncrementalTrainer {
     }
 
     async fn train_view(&mut self, view: &ViewData, added_depth_values: &mut [bool]) {
-        let batch = build_scene_batch(view);
+        let batch = self.build_scene_batch(view);
 
         let train_config = self.single_view_train_config();
 
@@ -357,6 +357,23 @@ impl IncrementalTrainer {
         log::info!("Updating poses took {:?}", start.elapsed());
     }*/
 
+    fn build_scene_batch(&self, view: &ViewData) -> SceneBatch {
+        let (img_packed, has_alpha) = sample_to_packed_data_without_copy(&view.image);
+        let depth_tensor = TensorData::new(
+            view.depth.to_vec(),
+            [view.image.height(), view.image.width()],
+        );
+        let view_index = self.frame_id_to_idx[&view.frame_id];
+        SceneBatch {
+            img_packed,
+            has_alpha,
+            alpha_mode: AlphaMode::Masked,
+            camera: view.camera,
+            depth: Some(depth_tensor),
+            view_index,
+        }
+    }
+
     async fn compute_occupancy_grid(&self) -> OccupancyGrid {
         let min_dist = self.config.occupancy_grid_size;
         let grid = OccupancyGrid::new(min_dist);
@@ -445,21 +462,6 @@ impl OccupancyGrid {
 
     fn is_free(&self, p: glam::Vec3) -> bool {
         !self.cells.contains(&self.cell_of(p))
-    }
-}
-
-fn build_scene_batch(view: &ViewData) -> SceneBatch {
-    let (img_packed, has_alpha) = sample_to_packed_data_without_copy(&view.image);
-    let depth_tensor = TensorData::new(
-        view.depth.to_vec(),
-        [view.image.height(), view.image.width()],
-    );
-    SceneBatch {
-        img_packed,
-        has_alpha,
-        alpha_mode: AlphaMode::Masked,
-        camera: view.camera,
-        depth: Some(depth_tensor),
     }
 }
 

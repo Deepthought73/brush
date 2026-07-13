@@ -92,8 +92,9 @@ pub struct IncrementalTrainer {
     message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
     done_sender: mpsc::Sender<()>,
 
-    train_views: HashMap<FrameId, ViewData>,
-    eval_views: HashMap<FrameId, ViewData>,
+    frame_id_to_idx: HashMap<FrameId, usize>,
+    train_views: Vec<ViewData>,
+    eval_views: Vec<ViewData>,
 
     view_sampler: Box<dyn ViewSampler>,
     rng: StdRng,
@@ -125,14 +126,14 @@ impl IncrementalTrainer {
         let device: burn::tensor::Device = wait_for_device().await.clone().into();
         device.seed(config.seed);
 
-        let view_sampler =
-            create_view_sampler(&config.train_config.view_sampling_strategy);
+        let view_sampler = create_view_sampler(&config.train_config.view_sampling_strategy);
 
         let rng = StdRng::from_seed([config.seed as u8; 32]);
 
         Self {
             message_receiver,
             done_sender,
+            frame_id_to_idx: Default::default(),
             train_views: Default::default(),
             eval_views: Default::default(),
             splat_sender,
@@ -160,17 +161,7 @@ impl IncrementalTrainer {
                 Some(message) => match message {
                     NewView(view_data) => {
                         self.update_up_axis(&view_data.camera);
-
-                        if view_data.is_eval {
-                            self.eval_views.insert(view_data.frame_id, view_data);
-                        } else {
-                            if view_data.is_host_frame {
-                                self.add_host_view(&view_data).await;
-                            }
-
-                            self.view_sampler.added_new_view(view_data.frame_id);
-                            self.train_views.insert(view_data.frame_id, view_data);
-                        }
+                        self.add_view(view_data).await;
                     }
                     ContinueTrain => {}
                 },
@@ -211,15 +202,29 @@ impl IncrementalTrainer {
         Ok(())
     }
 
+    async fn add_view(&mut self, view_data: ViewData) {
+        if view_data.is_eval {
+            self.eval_views.push(view_data);
+        } else {
+            self.view_sampler.added_new_view(self.train_views.len());
+            self.frame_id_to_idx
+                .insert(view_data.frame_id, self.train_views.len());
+            if view_data.is_host_frame {
+                self.add_host_view(&view_data).await;
+            }
+            self.train_views.push(view_data);
+        }
+    }
+
     async fn eval(&self, eval_train: bool) -> anyhow::Result<()> {
         if let Some(splats) = self.splats.clone() {
             let mut psnr_sum = 0.;
             let mut ssim_sum = 0.;
 
             let views = if eval_train {
-                self.train_views.values()
+                self.train_views.iter()
             } else {
-                self.eval_views.values()
+                self.eval_views.iter()
             };
             let num_views = views.len();
 

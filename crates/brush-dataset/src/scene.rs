@@ -148,6 +148,9 @@ pub struct SceneBatch {
     /// Optional `[H, W]` f32 metric depth map, `0` marking invalid depth.
     pub depth: Option<TensorData>,
     pub camera: Camera,
+    /// Index of the source view in `Scene::views`. Used to look up the matching
+    /// per-view camera-pose correction during joint pose optimization.
+    pub view_index: usize,
 }
 
 impl SceneBatch {

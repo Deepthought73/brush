@@ -43,6 +43,20 @@ pub struct TrainConfig {
     /// Learning rate for the rotation parameters.
     #[arg(long, help_heading = "Training options", default_value = "2e-3")]
     pub lr_rotation: f64,
+    
+    /// Jointly optimize the camera poses (extrinsics) alongside the splats.
+    /// Each training view gets a learnable SE(3) correction, refined from the
+    /// same gradient stream as the splats (see `pose_opt` module).
+    #[arg(long, help_heading = "Pose options", default_value = "false")]
+    pub pose_opt: bool,
+
+    /// Start learning rate for the per-view camera pose corrections.
+    #[arg(long, help_heading = "Pose options", default_value = "1e-4")]
+    pub lr_pose: f64,
+
+    /// End learning rate for the per-view camera pose corrections
+    #[arg(long, help_heading = "Pose options", default_value = "1e-5")]
+    pub lr_pose_end: f64,
 
     /// Max nr. of splats. This is only an upper bound, the actual final number of splats is NOT determined by this.
     #[arg(long, help_heading = "Refine options", default_value = "10000000")]

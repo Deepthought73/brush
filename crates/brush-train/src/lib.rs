@@ -11,6 +11,7 @@ mod multinomial;
 mod quat_vec;
 mod stats;
 
+mod pose_optimization;
 mod splat_init;
 
 pub use splat_init::{

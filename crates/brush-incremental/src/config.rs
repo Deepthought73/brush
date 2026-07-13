@@ -91,6 +91,9 @@ pub struct IncrementalTrainConfig {
     pub ssim_weight: f32,
     pub anti_needle_loss_weight: f32,
     pub depth_loss_weight: f32,
+
+    pub pose_opt: bool,
+    pub lr_pose_opt: f64,
 }
 
 impl Default for IncrementalProcessConfig {

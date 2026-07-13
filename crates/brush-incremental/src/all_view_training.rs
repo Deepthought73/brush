@@ -1,11 +1,12 @@
 use crate::IncrementalTrainer;
-use brush_dataset::scene::{sample_to_packed_data_without_copy, SceneBatch};
+use brush_dataset::scene::{SceneBatch, sample_to_packed_data_without_copy};
+use brush_render::AlphaMode;
 use brush_train::config::TrainConfig;
 use brush_train::train::{BOUND_PERCENTILE, SplatTrainer, get_splat_bounds};
 use burn::module::AutodiffModule;
-use std::time::Instant;
 use burn::tensor::TensorData;
-use brush_render::AlphaMode;
+use image::GenericImageView;
+use std::time::Instant;
 
 impl IncrementalTrainer {
     pub async fn train(&mut self) {
@@ -16,8 +17,10 @@ impl IncrementalTrainer {
         let start = Instant::now();
         let mut splats = self.splats.clone().unwrap();
         let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
+
         let config = self.create_all_view_train_config();
         let mut trainer = SplatTrainer::new(&config, &self.device, bounds);
+        trainer.enable_pose_opt(self.train_views.len(), &self.device);
         let trainer_init_dur = start.elapsed();
 
         let start = Instant::now();
@@ -32,6 +35,19 @@ impl IncrementalTrainer {
 
         log::info!("Trainer init: {trainer_init_dur:?}, Train dur: {train_dur:?}");
 
+        // Fold the learned per-view pose corrections back into the stored CPU
+        // cameras so they persist. `base` must be in training-view order, which
+        // matches how `view_index` is assigned (`frame_id_to_idx`). The trainer
+        // — and its deltas, which are zero-initialised each `new` — is dropped
+        // at the end of this call, so the corrected cameras become the new base
+        // for the next round with no double-application.
+        let base: Vec<_> = self.train_views.iter().map(|v| v.camera).collect();
+        if let Some(corrected) = trainer.corrected_train_cameras(&base).await {
+            for (view, cam) in self.train_views.iter_mut().zip(corrected) {
+                view.camera = cam;
+            }
+        }
+
         if let Some(splat_sender) = &self.splat_sender {
             splat_sender.set(0, splats.clone());
         }
@@ -40,12 +56,15 @@ impl IncrementalTrainer {
     }
 
     fn get_next_train_batch(&mut self) -> SceneBatch {
-        let frame_id = self.view_sampler.sample(&mut self.rng);
-        let view = &self.train_views[&frame_id];
+        let view_index = self.view_sampler.sample(&mut self.rng);
+        let view = &self.train_views[view_index];
 
         let (img_packed, has_alpha) = sample_to_packed_data_without_copy(&view.image);
 
-        let depth_tensor = TensorData::new(view.depth.clone(), [view.image.height(), view.image.width()]);
+        let depth_tensor = TensorData::new(
+            view.depth.clone(),
+            [view.image.height(), view.image.width()],
+        );
 
         SceneBatch {
             img_packed,
@@ -53,6 +72,7 @@ impl IncrementalTrainer {
             alpha_mode: AlphaMode::Masked,
             camera: view.camera,
             depth: Some(depth_tensor),
+            view_index,
         }
     }
 
@@ -60,11 +80,12 @@ impl IncrementalTrainer {
         let config = &self.config.train_config;
         let mut cfg = TrainConfig::default();
         cfg.total_train_iters = config.all_view_train_steps;
-        cfg.lr_mean = config.lr_mean;
         cfg.lr_mean_end = config.lr_mean;
-        cfg.ssim_weight = config.ssim_weight;
         cfg.anti_needle_loss_weight = config.anti_needle_loss_weight;
         cfg.depth_loss_weight = config.depth_loss_weight;
+        cfg.pose_opt = config.pose_opt;
+        cfg.lr_pose = config.lr_pose_opt;
+        cfg.lr_pose_end = config.lr_pose_opt;
         cfg
     }
 }

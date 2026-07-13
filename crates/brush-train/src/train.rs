@@ -1,5 +1,6 @@
 use std::f32::consts::FRAC_1_SQRT_2;
 
+use crate::pose_optimization::{PoseDeltaMagnitudes, PoseOptimizer};
 use crate::{
     adam_scaled::{AdamScaled, AdamScaledConfig, AdamState},
     config::TrainConfig,
@@ -15,6 +16,7 @@ use brush_render::camera::Camera;
 use brush_render::gaussian_splats::{RasterPass, RasterizationMode, Splats};
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::render_splats_with_pass;
+use burn::module::Param;
 use burn::{
     backend::wgpu::{AutoCompiler, WgpuDevice, WgpuRuntime},
     lr_scheduler::{
@@ -28,7 +30,6 @@ use burn::{
         s,
     },
 };
-
 use burn_cubecl::cubecl::Runtime;
 use hashbrown::{HashMap, HashSet};
 use tracing::{Instrument, trace_span};
@@ -66,6 +67,7 @@ pub struct GpuBatch {
     camera: Camera,
     img_h: usize,
     img_w: usize,
+    view_index: usize,
 }
 
 impl GpuBatch {
@@ -85,6 +87,7 @@ impl GpuBatch {
             camera: batch.camera,
             img_h,
             img_w,
+            view_index: batch.view_index,
         }
     }
 }
@@ -98,6 +101,7 @@ pub struct SplatTrainer {
     bounds: BoundingBox,
     step_count: u32,
     max_sh_degree: u32,
+    pose_opt: Option<PoseOptimizer>,
     /// Per-train-view (world center, focal in px at native res) for the
     /// Mip-Splatting 3D filter. Empty disables it. The floor itself lives on
     /// the splats (recomputed at each refine), not here.
@@ -181,6 +185,7 @@ impl SplatTrainer {
             bounds,
             step_count: 0,
             max_sh_degree: 0,
+            pose_opt: None,
             view_cams: Vec::new(),
             #[cfg(not(target_family = "wasm"))]
             lpips,
@@ -191,6 +196,22 @@ impl SplatTrainer {
     /// the Mip-Splatting 3D filter (gated on `config.min_scale_factor > 0`).
     pub fn set_view_cams(&mut self, view_cams: Vec<(glam::Vec3, f32)>) {
         self.view_cams = view_cams;
+    }
+
+    /// Enable joint camera-pose optimization for a scene with `num_views`
+    /// training views. No-op unless `config.pose_opt` is set. Call once after
+    /// [`SplatTrainer::new`] (and after each LOD-phase rebuild).
+    pub fn enable_pose_opt(&mut self, num_views: usize, device: &Device) {
+        if self.config.pose_opt && num_views > 0 {
+            self.pose_opt = Some(PoseOptimizer::new(num_views, &self.config, device));
+        }
+    }
+
+    /// Optimized camera poses for the training views, or `None` if pose
+    /// optimization is disabled. `base` must be in training-view order.
+    pub async fn corrected_train_cameras(&self, base: &[Camera]) -> Option<Vec<Camera>> {
+        let po = self.pose_opt.as_ref()?;
+        Some(po.corrected_cameras(base).await)
     }
 
     /// Upload a `SceneBatch`'s GT to the GPU, then take one step. Fine for
@@ -234,10 +255,22 @@ impl SplatTrainer {
 
         let median_scale = self.bounds.median_size();
 
+        let pose_opt_active = self.pose_opt.as_ref().is_some();
+
         let (mut grads, visible, num_visible, loss_inner) = {
             // The splats already carry their 3D-filter floor (set at refine);
             // the render path folds it in. Optimizer/refine work on raw params.
-            let render_input = splats.clone();
+            let mut render_input = splats.clone();
+            if pose_opt_active {
+                let po = self.pose_opt.as_ref().expect("pose opt is active");
+                let corrected =
+                    po.apply(splats.transforms.val(), batch.view_index, camera.position);
+                // Wrap the derived (non-leaf) tensor for the render. Do NOT
+                // detach/require_grad — that would sever the graph back to the
+                // splat and pose leaves; gradients must chain through here.
+                render_input.transforms = Param::initialized(ParamId::new(), corrected);
+            }
+
             let use_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
             let raster_mode = if use_depth {
                 RasterizationMode::RgbaAndDepth
@@ -454,6 +487,16 @@ impl SplatTrainer {
             });
             splats
         });
+
+        // Step the per-view camera poses from the same gradient stream.
+        if pose_opt_active {
+            trace_span!("Pose step").in_scope(|| {
+                self.pose_opt
+                    .as_mut()
+                    .expect("pose opt is active")
+                    .optimize(&mut grads);
+            });
+        }
 
         // Add random noise. Only do this in the growth phase, otherwise
         // let the splats settle in without noise, not much point in exploring regions anymore.
