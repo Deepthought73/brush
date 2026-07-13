@@ -1,5 +1,5 @@
 use crate::IncrementalTrainMessage::NewView;
-use crate::config::IncrementalTrainConfig;
+use crate::config::IncrementalProcessConfig;
 use crate::view_sampling::{ViewSampler, create_view_sampler};
 use IncrementalTrainMessage::ContinueTrain;
 use anyhow::Context;
@@ -49,7 +49,7 @@ impl ViewData {
 pub fn create_incremental_training_process(
     message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
     done_sender: mpsc::Sender<()>,
-    config: IncrementalTrainConfig,
+    config: IncrementalProcessConfig,
 ) -> RunningProcess {
     let (splat_tx, splat_view) = slot::channel();
 
@@ -76,7 +76,7 @@ pub fn run_incremental_training_headless(
     runtime: &Runtime,
     message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
     done_sender: mpsc::Sender<()>,
-    config: IncrementalTrainConfig,
+    config: IncrementalProcessConfig,
 ) {
     runtime.spawn(async move {
         brush_process::burn_init_setup().await;
@@ -100,7 +100,7 @@ pub struct IncrementalTrainer {
 
     training_start: Option<Instant>,
     splats: Option<Splats>,
-    config: IncrementalTrainConfig,
+    config: IncrementalProcessConfig,
 
     corresponding_splats: HashMap<FrameId, (usize, usize)>,
 
@@ -120,13 +120,13 @@ impl IncrementalTrainer {
         done_sender: mpsc::Sender<()>,
         splat_sender: Option<SlotSender<Splats>>,
         emitter: Option<TryStreamEmitter<ProcessMessage, anyhow::Error>>,
-        config: IncrementalTrainConfig,
+        config: IncrementalProcessConfig,
     ) -> Self {
         let device: burn::tensor::Device = wait_for_device().await.clone().into();
         device.seed(config.seed);
 
         let view_sampler =
-            create_view_sampler(&config.all_view_train_config.view_sampling_strategy);
+            create_view_sampler(&config.train_config.view_sampling_strategy);
 
         let rng = StdRng::from_seed([config.seed as u8; 32]);
 
@@ -186,7 +186,7 @@ impl IncrementalTrainer {
             if let Some(eval_every) = self.config.eval_every_sec
                 && training_secs >= eval_every * eval_count
             {
-                self.eval(false).await?;
+                self.eval(self.config.eval_train_views).await?;
 
                 if self.config.export_on_eval {
                     self.export_checkpoint().await?;
@@ -207,8 +207,6 @@ impl IncrementalTrainer {
         }
 
         log::info!("Finish training thread");
-
-        self.eval(true).await?;
 
         Ok(())
     }
@@ -256,7 +254,7 @@ impl IncrementalTrainer {
             }
 
             log::info!(
-                "Train time: {:.2}, PSNR: {}, SSIM: {}",
+                "Train time: {:.2}, Eval views: {num_views}, PSNR: {}, SSIM: {}",
                 self.training_start.unwrap().elapsed().as_secs_f64(),
                 psnr,
                 ssim

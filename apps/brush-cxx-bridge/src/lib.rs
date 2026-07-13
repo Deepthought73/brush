@@ -1,7 +1,7 @@
 use crate::ffi::CameraModelId;
 use brush_app::ui::app::App;
 use brush_incremental::IncrementalTrainMessage::{ContinueTrain, NewView};
-use brush_incremental::config::IncrementalTrainConfig;
+use brush_incremental::config::IncrementalProcessConfig;
 use brush_incremental::{
     IncrementalTrainMessage, ViewData, create_incremental_training_process,
     run_incremental_training_headless,
@@ -62,7 +62,7 @@ mod ffi {
 }
 
 struct BrushBridge {
-    config: IncrementalTrainConfig,
+    config: IncrementalProcessConfig,
 
     message_sender: mpsc::Sender<IncrementalTrainMessage>,
     message_receiver: Option<mpsc::Receiver<IncrementalTrainMessage>>,
@@ -312,9 +312,9 @@ impl BrushBridge {
     }
 }
 
-fn get_config(config_path: String) -> IncrementalTrainConfig {
+fn get_config(config_path: String) -> IncrementalProcessConfig {
     if config_path.is_empty() {
-        IncrementalTrainConfig::default()
+        IncrementalProcessConfig::default()
     } else {
         let config_path = PathBuf::from(config_path);
         if fs::exists(&config_path).unwrap_or(false) {
@@ -323,10 +323,10 @@ fn get_config(config_path: String) -> IncrementalTrainConfig {
         } else {
             serde_json::to_writer(
                 File::create(&config_path).unwrap(),
-                &IncrementalTrainConfig::default(),
+                &IncrementalProcessConfig::default(),
             )
             .unwrap();
-            IncrementalTrainConfig::default()
+            IncrementalProcessConfig::default()
         }
     }
 }

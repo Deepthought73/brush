@@ -21,12 +21,15 @@ pub enum DensifyScaleMode {
 
 #[derive(Parser, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub struct IncrementalTrainConfig {
+pub struct IncrementalProcessConfig {
     #[arg(long, default_value = "42")]
     pub seed: u64,
 
     #[arg(long)]
     pub eval_every_sec: Option<f64>,
+
+    #[arg(long)]
+    pub eval_train_views: bool,
 
     #[arg(long, default_value = "true")]
     pub export_on_eval: bool,
@@ -61,22 +64,22 @@ pub struct IncrementalTrainConfig {
 
     #[arg(skip)]
     #[serde(default)]
-    pub single_view_train_config: SingleViewTrainConfig,
+    pub train_config: IncrementalTrainConfig,
 
-    #[arg(skip)]
-    #[serde(default)]
-    pub all_view_train_config: AllViewTrainConfig,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub struct SingleViewTrainConfig {
+pub struct IncrementalTrainConfig {
+    pub view_sampling_strategy: String,
+    pub all_view_train_steps: u32,
+
     pub densify_every: u32,
     pub densify_max_samples: usize,
     pub densify_recip_weighting: bool,
     pub densify_scale_mode: DensifyScaleMode,
     pub densify_const_cov_scale: f32,
-    pub steps: u32,
+    pub single_view_train_steps: u32,
     pub lr_mean: f64,
     pub lr_mean_end: f64,
     pub mean_noise_weight: f32,
@@ -90,31 +93,7 @@ pub struct SingleViewTrainConfig {
     pub depth_loss_weight: f32,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct AllViewTrainConfig {
-    pub view_sampling_strategy: String,
-    pub steps: u32,
-    pub lr_mean: f64,
-    pub ssim_weight: f32,
-    pub anti_needle_loss_weight: f32,
-    pub depth_loss_weight: f32,
-}
-
-impl Default for AllViewTrainConfig {
-    fn default() -> Self {
-        Self {
-            view_sampling_strategy: "random".to_string(),
-            steps: 20,
-            lr_mean: 2e-5,
-            ssim_weight: 0.2,
-            anti_needle_loss_weight: 0.05,
-            depth_loss_weight: 0.1,
-        }
-    }
-}
-
-impl Default for IncrementalTrainConfig {
+impl Default for IncrementalProcessConfig {
     fn default() -> Self {
         Self::parse_from([""])
     }

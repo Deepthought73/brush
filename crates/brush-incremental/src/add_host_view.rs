@@ -58,7 +58,7 @@ impl IncrementalTrainer {
         let mut gpu_batch: Option<GpuBatch> = None;
 
         for step in 1..=train_config.total_train_iters {
-            if step.is_multiple_of(self.config.single_view_train_config.densify_every) {
+            if step.is_multiple_of(self.config.train_config.densify_every) {
                 self.densify_by_ssim(view, added_depth_values).await;
                 trainer = SplatTrainer::new(
                     &self.single_view_train_config(),
@@ -174,7 +174,7 @@ impl IncrementalTrainer {
     }
 
     async fn densify_by_ssim(&mut self, view: &ViewData, added: &mut [bool]) {
-        let cfg = self.config.single_view_train_config.clone();
+        let cfg = self.config.train_config.clone();
         let w = view.image.width() as usize;
         let h = view.image.height() as usize;
         let img_size = view.glam_img_size();
@@ -391,10 +391,10 @@ impl IncrementalTrainer {
     }
 
     fn single_view_train_config(&self) -> TrainConfig {
-        let cfg = &self.config.single_view_train_config;
+        let cfg = &self.config.train_config;
         let mut train = TrainConfig::default();
 
-        train.total_train_iters = cfg.steps;
+        train.total_train_iters = cfg.single_view_train_steps;
         train.render_mode = Some(self.config.render_mode);
 
         train.lr_mean = cfg.lr_mean;

@@ -1,23 +1,21 @@
-- loop closure working: update gaussians hosted by keyframes after the keyframes got updated by loop closure
-      ./build/bal --input map/map.json --solver-type SQUARE_ROOT --calibration-file $DS_CALIB --no-normalize --residual-robust-norm HUBER --no-use-double --optimized-cost ERROR_VALID --output-optimized-path map/optimized_tracking.csv --min-obs-per-kf 20 2>&1 | tee output.$DATASET.bal.log
+- optimize poses during gaussian optimization
 
-- regulate number of keyframes that are used for GS training -> reduce required depth maps/s
-
-- handle keyframe culling by loop closure
-
-- covisibility query (already in basalt)
+- implement importance sampling based pruning during densification phase
+    - use laplacian of image instead of SSIM map
 
 - run BA in background to improve poses over time
+    - loop closure working: update gaussians hosted by keyframes after the keyframes got updated by loop closure
+      ./build/bal --input map/map.json --solver-type SQUARE_ROOT --calibration-file $DS_CALIB --no-normalize --residual-robust-norm HUBER --no-use-double --optimized-cost ERROR_VALID --output-optimized-path map/optimized_tracking.csv --min-obs-per-kf 20 2>&1 | tee output.$DATASET.bal.log
+
+- decide which keyframes to use
+    - possible profit from loop closure keyframe culling by loop closure
+    - covisibility query (already in basalt)
+
+- experiment, which images to train on during all view training phase
 
 - optimize poses while training GS
 
-- compute gradients from stereo pair, not just single image
-
 - keep images on GPU/avoid moving images to GPU from CPU all the time
-
-- densification ideas:
-    - pruning by opacity
-    - start with low opacity
 
 - optimize poses while training GS
 

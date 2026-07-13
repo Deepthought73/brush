@@ -9,6 +9,10 @@ use brush_render::AlphaMode;
 
 impl IncrementalTrainer {
     pub async fn train(&mut self) {
+        if self.config.train_config.all_view_train_steps == 0 {
+            return;
+        }
+
         let start = Instant::now();
         let mut splats = self.splats.clone().unwrap();
         let bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
@@ -53,9 +57,9 @@ impl IncrementalTrainer {
     }
 
     fn create_all_view_train_config(&self) -> TrainConfig {
-        let config = &self.config.all_view_train_config;
+        let config = &self.config.train_config;
         let mut cfg = TrainConfig::default();
-        cfg.total_train_iters = config.steps;
+        cfg.total_train_iters = config.all_view_train_steps;
         cfg.lr_mean = config.lr_mean;
         cfg.lr_mean_end = config.lr_mean;
         cfg.ssim_weight = config.ssim_weight;
