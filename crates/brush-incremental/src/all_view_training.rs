@@ -65,17 +65,17 @@ impl IncrementalTrainer {
 
         let (img_packed, has_alpha) = sample_to_packed_data_without_copy(&view.image);
 
-        let depth_tensor = TensorData::new(
-            view.depth.clone(),
-            [view.image.height(), view.image.width()],
-        );
+        let depth = view
+            .depth
+            .as_ref()
+            .map(|depth| TensorData::new(depth.clone(), [view.image.height(), view.image.width()]));
 
         SceneBatch {
             img_packed,
             has_alpha,
             alpha_mode: AlphaMode::Masked,
             camera: view.camera,
-            depth: Some(depth_tensor),
+            depth,
             view_index,
         }
     }
@@ -84,6 +84,7 @@ impl IncrementalTrainer {
         let config = &self.config.train_config;
         let mut cfg = TrainConfig::default();
         cfg.total_train_iters = config.all_view_train_steps;
+        cfg.lr_mean = config.lr_mean;
         cfg.lr_mean_end = config.lr_mean;
         cfg.anti_needle_loss_weight = config.anti_needle_loss_weight;
         cfg.depth_loss_weight = config.depth_loss_weight;

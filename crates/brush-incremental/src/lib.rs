@@ -1,4 +1,4 @@
-use crate::IncrementalTrainMessage::NewView;
+use crate::IncrementalTrainMessage::{ExternalPoseUpdate, NewView};
 use crate::config::IncrementalProcessConfig;
 use crate::view_sampling::{ViewSampler, create_view_sampler};
 use IncrementalTrainMessage::ContinueTrain;
@@ -10,12 +10,13 @@ use brush_process::{RunningProcess, slot, wait_for_device};
 use brush_render::{AlphaMode, camera::Camera, gaussian_splats::Splats};
 use brush_train::eval::eval_stats;
 use image::DynamicImage;
+use parking_lot::Mutex;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 mod add_host_view;
@@ -37,7 +38,7 @@ pub struct ViewData {
     pub frame_id: FrameId,
     pub camera: Camera,
     pub image: DynamicImage,
-    pub depth: Vec<f32>,
+    pub depth: Option<Vec<f32>>,
     pub is_eval: bool,
     pub is_host_frame: bool,
 }
@@ -48,24 +49,28 @@ impl ViewData {
     }
 }
 
+pub struct IncrementalTrainerCreationContext {
+    pub message_receiver: mpsc::UnboundedReceiver<IncrementalTrainMessage>,
+    pub gpu_mutex: Arc<Mutex<()>>,
+    pub config: IncrementalProcessConfig,
+}
+
 pub fn create_incremental_training_process(
-    message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
-    done_sender: mpsc::Sender<()>,
-    config: IncrementalProcessConfig,
+    cc: IncrementalTrainerCreationContext,
 ) -> RunningProcess {
     let (splat_tx, splat_view) = slot::channel();
 
     let stream = try_fn_stream(|emitter| async move {
-        let mut train_ctx = IncrementalTrainer::new(
-            message_receiver,
-            done_sender,
+        let mut trainer = IncrementalTrainer::new(
+            cc.message_receiver,
+            cc.gpu_mutex,
             Some(splat_tx),
             Some(emitter),
-            config,
+            cc.config,
         )
         .await;
-        train_ctx.init_ui().await;
-        train_ctx.run_train_loop().await
+        trainer.init_ui().await;
+        trainer.run().await
     });
 
     RunningProcess {
@@ -74,25 +79,22 @@ pub fn create_incremental_training_process(
     }
 }
 
-pub fn run_incremental_training_headless(
-    runtime: &Runtime,
-    message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
-    done_sender: mpsc::Sender<()>,
-    config: IncrementalProcessConfig,
-) {
-    runtime.spawn(async move {
-        brush_process::burn_init_setup().await;
+pub async fn run_incremental_training_headless(
+    cc: IncrementalTrainerCreationContext,
+) -> anyhow::Result<()> {
+    brush_process::burn_init_setup().await;
 
-        let mut train_ctx =
-            IncrementalTrainer::new(message_receiver, done_sender, None, None, config).await;
+    let mut trainer =
+        IncrementalTrainer::new(cc.message_receiver, cc.gpu_mutex, None, None, cc.config).await;
 
-        train_ctx.run_train_loop().await
-    });
+    trainer.run().await?;
+
+    Ok(())
 }
 
 pub struct IncrementalTrainer {
-    message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
-    done_sender: mpsc::Sender<()>,
+    message_receiver: mpsc::UnboundedReceiver<IncrementalTrainMessage>,
+    gpu_mutex: Arc<Mutex<()>>,
 
     train_frame_id_to_idx: HashMap<FrameId, usize>,
     eval_frame_id_to_idx: HashMap<FrameId, usize>,
@@ -120,8 +122,8 @@ pub struct IncrementalTrainer {
 
 impl IncrementalTrainer {
     async fn new(
-        message_receiver: mpsc::Receiver<IncrementalTrainMessage>,
-        done_sender: mpsc::Sender<()>,
+        message_receiver: mpsc::UnboundedReceiver<IncrementalTrainMessage>,
+        gpu_mutex: Arc<Mutex<()>>,
         splat_sender: Option<SlotSender<Splats>>,
         emitter: Option<TryStreamEmitter<ProcessMessage, anyhow::Error>>,
         config: IncrementalProcessConfig,
@@ -135,7 +137,7 @@ impl IncrementalTrainer {
 
         Self {
             message_receiver,
-            done_sender,
+            gpu_mutex,
             train_frame_id_to_idx: Default::default(),
             eval_frame_id_to_idx: Default::default(),
             train_views: Default::default(),
@@ -155,7 +157,7 @@ impl IncrementalTrainer {
         }
     }
 
-    async fn run_train_loop(&mut self) -> anyhow::Result<()> {
+    async fn run(&mut self) -> anyhow::Result<()> {
         log::info!("Start training thread");
 
         let mut eval_count = 0.0;
@@ -165,9 +167,12 @@ impl IncrementalTrainer {
                 Some(message) => match message {
                     NewView(view_data) => {
                         self.update_up_axis(&view_data.camera);
-                        self.add_view(view_data).await;
+                        {
+                            let _guard = self.gpu_mutex.lock_arc();
+                            self.add_view(view_data).await;
+                        }
                     }
-                    IncrementalTrainMessage::ExternalPoseUpdate(new_poses) => {
+                    ExternalPoseUpdate(new_poses) => {
                         self.update_poses(new_poses).await;
                         continue;
                     }
@@ -178,7 +183,10 @@ impl IncrementalTrainer {
 
             let training_secs = self.training_secs();
 
-            self.train().await;
+            {
+                let _guard = self.gpu_mutex.lock_arc();
+                self.train().await;
+            }
 
             if let Some(eval_every) = self.config.eval_every_sec
                 && training_secs >= eval_every * eval_count
@@ -190,10 +198,6 @@ impl IncrementalTrainer {
                 }
 
                 eval_count += 1.0;
-            }
-
-            if self.done_sender.send(()).await.is_err() {
-                break;
             }
 
             self.update_ui_dataset().await;

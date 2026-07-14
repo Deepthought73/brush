@@ -8,14 +8,18 @@ use brush_render::{AlphaMode, Splats};
 use brush_serde::SplatData;
 use brush_train::config::TrainConfig;
 use brush_train::eval::ssim_map;
+use brush_train::to_init_splats;
 use brush_train::train::{GpuBatch, SplatTrainer};
-use brush_train::{knn_scales_with_context, to_init_splats};
 use burn::Tensor;
 use burn::module::AutodiffModule;
 use burn::tensor::TensorData;
 use dashmap::DashSet;
+use rand::SeedableRng;
+use rand::prelude::Distribution;
+use rand::rngs::SmallRng;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
+use std::time::Instant;
 
 const TRAINER_BOUNDING_BOX: BoundingBox = BoundingBox {
     center: glam::Vec3::ZERO,
@@ -40,7 +44,9 @@ impl IncrementalTrainer {
             }
         };
 
-        self.train_view(view, &mut added_depth_values).await;
+        if self.config.train_config.single_view_train_steps > 0 {
+            self.train_view(view, &mut added_depth_values).await;
+        }
 
         let splats_after = self.splats.as_ref().unwrap().num_splats() as usize;
 
@@ -59,7 +65,7 @@ impl IncrementalTrainer {
 
         for step in 1..=train_config.total_train_iters {
             if step.is_multiple_of(self.config.train_config.densify_every) {
-                self.densify_by_ssim(view, added_depth_values).await;
+                self.densify(view, added_depth_values).await;
                 trainer = SplatTrainer::new(
                     &self.single_view_train_config(),
                     &self.device,
@@ -73,7 +79,7 @@ impl IncrementalTrainer {
             let gt = gpu_batch.get_or_insert_with(|| {
                 GpuBatch::from_scene_batch(batch.clone(), &diff_splats.device())
             });
-            let (new_diff, _stats) = trainer.step_prepared(gt, diff_splats).await;
+            let (new_diff, _) = trainer.step_prepared(gt, diff_splats).await;
             self.splats = Some(new_diff.valid());
         }
     }
@@ -94,10 +100,11 @@ impl IncrementalTrainer {
 
         let grid = self.compute_occupancy_grid().await;
 
+        let depth = view.depth.as_ref().unwrap();
         let candidates: Vec<(usize, glam::Vec3, f32, f32)> = (0..h * w)
             .into_par_iter()
             .filter_map(|idx| {
-                let d = view.depth[idx];
+                let d = depth[idx];
                 if d <= 0.01 {
                     return None;
                 }
@@ -131,7 +138,7 @@ impl IncrementalTrainer {
             log_scales.extend_from_slice(&[log_s, log_s, log_s]);
         }
 
-        self.add_by_means(means, sh_coeffs, log_scales)
+        self.add_by_means(means, sh_coeffs, Some(log_scales))
     }
 
     fn add_from_strided_depth(&mut self, view: &ViewData, added: &mut [bool]) {
@@ -147,11 +154,12 @@ impl IncrementalTrainer {
         let mut sh_coeffs = vec![];
         let mut log_scales = vec![];
 
+        let depth = view.depth.as_ref().unwrap();
         for v in (0..h).step_by(stride) {
             for u in (0..w).step_by(stride) {
                 let idx = v * w + u;
 
-                let d = view.depth[idx];
+                let d = depth[idx];
                 if d <= 0.01 {
                     continue;
                 }
@@ -166,19 +174,28 @@ impl IncrementalTrainer {
                 added[idx] = true;
                 means.extend_from_slice(&[pos_world.x, pos_world.y, pos_world.z]);
                 sh_coeffs.extend_from_slice(&[color, color, color]);
-                log_scales.extend_from_slice(&[log_s, log_s, log_s]);
+                if !self.config.init_scales_with_knn {
+                    log_scales.extend_from_slice(&[log_s, log_s, log_s]);
+                }
             }
         }
 
-        self.add_by_means(means, sh_coeffs, log_scales)
+        if self.config.init_scales_with_knn {
+            self.add_by_means(means, sh_coeffs, None)
+        } else {
+            self.add_by_means(means, sh_coeffs, Some(log_scales))
+        }
     }
 
-    async fn densify_by_ssim(&mut self, view: &ViewData, added: &mut [bool]) {
+    async fn densify(&mut self, view: &ViewData, added: &mut [bool]) {
+        log::info!("==============================================");
+
         let cfg = self.config.train_config.clone();
         let w = view.image.width() as usize;
         let h = view.image.height() as usize;
         let img_size = view.glam_img_size();
 
+        let start = Instant::now();
         let splats = self.splats.clone().unwrap();
         let ssim = ssim_map(
             splats,
@@ -195,76 +212,110 @@ impl IncrementalTrainer {
             .mean()
             .into_scalar_async::<f32>()
             .await
-            .expect("failed to read mean ssim")
+            .unwrap()
             .clamp(-1.0, 1.0);
+        log::info!("Computing SSIM took: {:?}", start.elapsed());
 
         let num_samples =
             (cfg.densify_max_samples as f32 * (1.0 - 0.5 * mean_ssim - 0.5)).round() as usize;
+        log::info!("SSIM={mean_ssim} -> num_samples={num_samples}");
+
         if num_samples == 0 {
+            log::info!("==============================================");
             return;
         }
 
+        let start = Instant::now();
         let ssim_cpu = ssim
             .into_data_async()
             .await
-            .expect("failed to read ssim map")
+            .unwrap()
             .into_vec::<f32>()
-            .expect("ssim map should be f32");
+            .unwrap();
+        log::info!("Moving SSIM to CPU took: {:?}", start.elapsed());
 
-        let weights: Vec<f32> = (0..w * h)
-            .map(|idx| {
-                if added[idx] || view.depth[idx] < 0.1 {
-                    0.0
-                } else if cfg.densify_recip_weighting {
-                    1.0 / (ssim_cpu[idx].clamp(-1.0, 1.0) + 1.0 + 0.1) - 1.0 / (2.0 + 0.1)
-                } else {
-                    (1.0 - ssim_cpu[idx].clamp(-1.0, 1.0)) + 0.1
-                }
-            })
-            .collect();
+        let start = Instant::now();
+        let depth = view.depth.as_ref().unwrap();
+        // Collect only the candidate pixels (weight > 0) into a compact set, so
+        // the sampler never has to scan the many zero-weight (already-added or
+        // no-depth) pixels.
+        let mut candidate_idx: Vec<usize> = Vec::new();
+        let mut candidate_wts: Vec<f32> = Vec::new();
+        for idx in 0..w * h {
+            if added[idx] || depth[idx] < 0.1 || ssim_cpu[idx] >= cfg.densify_ssim_threshold {
+                continue;
+            }
+            let wt = if cfg.densify_recip_weighting {
+                1.0 / (ssim_cpu[idx].clamp(-1.0, 1.0) + 1.0 + 0.1) - 1.0 / (2.0 + 0.1)
+            } else {
+                (1.0 - ssim_cpu[idx].clamp(-1.0, 1.0)) + 0.1
+            };
+            if wt > 0.0 {
+                candidate_idx.push(idx);
+                candidate_wts.push(wt);
+            }
+        }
 
-        let valid = weights.iter().filter(|&&wt| wt > 0.0).count();
+        let valid = candidate_idx.len();
         let n = num_samples.min(valid);
         if n == 0 {
             return;
         }
+        log::info!("Computing sampling weights took: {:?}", start.elapsed());
 
-        let sampled = {
-            let mut rng = rand::rng();
-            rand::seq::index::sample_weighted(&mut rng, w * h, |i| weights[i], n)
-                .expect("failed to sample ssim-weighted pixels")
-        };
+        let start = Instant::now();
+        // Weighted sampling *with* replacement via an O(1)-per-draw alias table,
+        // deduplicated against `added`. Since n << valid, collisions are rare so
+        // the retry loop is cheap, and the result matches without-replacement
+        // sampling. A fast (non-cryptographic) RNG is seeded from `self.rng` to
+        // keep runs deterministic.
+        let dist = rand_distr::weighted::WeightedAliasIndex::new(candidate_wts)
+            .expect("failed to build ssim-weighted alias table");
+        let mut rng = SmallRng::from_rng(&mut self.rng);
+        let mut sampled: Vec<usize> = Vec::with_capacity(n);
+        while sampled.len() < n {
+            let idx = candidate_idx[dist.sample(&mut rng)];
+            if !added[idx] {
+                added[idx] = true;
+                sampled.push(idx);
+            }
+        }
+        log::info!("Sampling took: {:?}", start.elapsed());
 
+        let start = Instant::now();
         let raw_img = view.image.as_rgba8().unwrap().as_raw();
         let mut means = Vec::with_capacity(n * 3);
         let mut sh_coeffs = Vec::with_capacity(n * 3);
-        for idx in sampled.iter() {
-            added[idx] = true;
+        let depth = view.depth.as_ref().unwrap();
+        for &idx in sampled.iter() {
             let u = idx % w;
             let v = idx / w;
             let uv = glam::Vec2::new(u as f32 + 0.5, v as f32 + 0.5);
-            let pos_world =
-                view.camera
-                    .transform(view.camera.unproject(uv, view.depth[idx], img_size));
+            let pos_world = view
+                .camera
+                .transform(view.camera.unproject(uv, depth[idx], img_size));
             let color = (raw_img[idx * 4] as f32 / 255.0 - 0.5) / SH_C0;
             means.extend_from_slice(&[pos_world.x, pos_world.y, pos_world.z]);
             sh_coeffs.extend_from_slice(&[color, color, color]);
         }
+        log::info!("Creating points took: {:?}", start.elapsed());
 
+        let start = Instant::now();
         let log_scales = match cfg.densify_scale_mode {
-            DensifyScaleMode::Constant => {
-                vec![cfg.densify_const_cov_scale.max(1e-6).ln(); means.len()]
-            }
-            DensifyScaleMode::Knn => {
-                let existing = self.read_means().await;
-                knn_scales_with_context(&existing, &means)
-            }
+            DensifyScaleMode::Constant => Some(vec![
+                cfg.densify_const_cov_scale.max(1e-6).ln();
+                means.len()
+            ]),
+            DensifyScaleMode::Knn => None,
         };
 
         self.add_by_means(means, sh_coeffs, log_scales);
+        log::info!("Adding to splats took: {:?}", start.elapsed());
+
+        log::info!("==============================================");
     }
 
-    fn add_by_means(&mut self, means: Vec<f32>, sh_coeffs: Vec<f32>, log_scales: Vec<f32>) {
+    fn add_by_means(&mut self, means: Vec<f32>, sh_coeffs: Vec<f32>, log_scales: Option<Vec<f32>>) {
         let sh_degree = self.config.sh_degree;
         let render_mode = self.config.render_mode;
 
@@ -273,7 +324,7 @@ impl IncrementalTrainer {
             SplatData {
                 means,
                 rotations: None,
-                log_scales: Some(log_scales),
+                log_scales,
                 sh_coeffs: Some(sh_coeffs),
                 raw_opacities: Some(vec![
                     inverse_sigmoid(self.config.cov_init_opacity);
@@ -295,17 +346,16 @@ impl IncrementalTrainer {
 
     fn build_scene_batch(&self, view: &ViewData) -> SceneBatch {
         let (img_packed, has_alpha) = sample_to_packed_data_without_copy(&view.image);
-        let depth_tensor = TensorData::new(
-            view.depth.to_vec(),
-            [view.image.height(), view.image.width()],
-        );
+        let depth = view.depth.as_ref().map(|depth| {
+            TensorData::new(depth.to_vec(), [view.image.height(), view.image.width()])
+        });
         let view_index = self.train_frame_id_to_idx[&view.frame_id];
         SceneBatch {
             img_packed,
             has_alpha,
             alpha_mode: AlphaMode::Masked,
             camera: view.camera,
-            depth: Some(depth_tensor),
+            depth,
             view_index,
         }
     }
@@ -331,18 +381,6 @@ impl IncrementalTrainer {
         grid
     }
 
-    async fn read_means(&self) -> Vec<f32> {
-        self.splats
-            .as_ref()
-            .unwrap()
-            .means()
-            .into_data_async()
-            .await
-            .expect("failed to read gaussian means")
-            .into_vec::<f32>()
-            .expect("means tensor should be f32")
-    }
-
     fn single_view_train_config(&self) -> TrainConfig {
         let cfg = &self.config.train_config;
         let mut train = TrainConfig::default();
@@ -351,11 +389,7 @@ impl IncrementalTrainer {
         train.render_mode = Some(self.config.render_mode);
 
         train.lr_mean = cfg.lr_mean;
-        train.lr_mean_end = cfg.lr_mean_end;
-        train.mean_noise_weight = cfg.mean_noise_weight;
-
-        train.lr_mean = cfg.lr_mean;
-        train.lr_mean_end = cfg.lr_mean_end;
+        train.lr_mean_end = cfg.lr_mean;
         train.mean_noise_weight = cfg.mean_noise_weight;
         train.lr_coeffs_dc = cfg.lr_coeffs_dc;
         train.lr_coeffs_sh_scale = cfg.lr_coeffs_sh_scale;

@@ -14,6 +14,4 @@ mod stats;
 mod pose_optimization;
 mod splat_init;
 
-pub use splat_init::{
-    RandomSplatsConfig, create_random_splats, knn_scales_with_context, to_init_splats,
-};
+pub use splat_init::{RandomSplatsConfig, create_random_splats, to_init_splats};

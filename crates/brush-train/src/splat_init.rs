@@ -215,60 +215,6 @@ fn compute_knn_scales(pos_data: &[f32]) -> Vec<f32> {
     })
 }
 
-/// KNN-density log-scales for `new_means`, using `existing_means` + `new_means`
-/// together as the neighbour set so the new gaussians' scales respect the
-/// already-present ones. Only the scales for the new points are returned (3 per
-/// point). Mirrors [`compute_knn_scales`]: half the average of the 2 nearest
-/// neighbour distances, clamped and log-transformed.
-pub fn knn_scales_with_context(existing_means: &[f32], new_means: &[f32]) -> Vec<f32> {
-    let _ = trace_span!("knn_scales_with_context").entered();
-
-    let new_count = new_means.len() / 3;
-    if new_count == 0 {
-        return Vec::new();
-    }
-
-    let mut all = Vec::with_capacity(existing_means.len() + new_means.len());
-    all.extend_from_slice(existing_means);
-    all.extend_from_slice(new_means);
-
-    // Need at least self + 2 neighbours for every query.
-    if all.len() / 3 < 3 {
-        return vec![0.0; new_count * 3];
-    }
-
-    let median_size = bounds_from_pos(0.75, &all).median_size().max(0.01);
-
-    let tree_points: Vec<BallPoint> = all
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|v| BallPoint(glam::Vec3A::new(v[0], v[1], v[2])))
-        .collect();
-    let empty = vec![(); tree_points.len()];
-    let tree = BallTree::new(tree_points, empty);
-
-    let new_points: Vec<BallPoint> = new_means
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|v| BallPoint(glam::Vec3A::new(v[0], v[1], v[2])))
-        .collect();
-
-    new_points
-        .par_iter()
-        .map_with(tree.query(), |query, p| {
-            // Skip the point itself (distance 0), then average the next 2.
-            let mut q = query.nn(p).skip(1);
-            let a1 = q.next().unwrap().1 as f32;
-            let a2 = q.next().unwrap().1 as f32;
-            let dist = (a1 + a2) / 4.0;
-            dist.clamp(1e-3, median_size * 0.1).ln()
-        })
-        .flat_map(|p| [p, p, p])
-        .collect()
-}
-
 pub fn to_init_splats(data: SplatData, mode: SplatRenderMode, device: &Device) -> Splats {
     let n_splats = data.num_splats();
 

@@ -55,6 +55,9 @@ pub struct IncrementalProcessConfig {
     #[arg(long, default_value = "2.0")]
     pub cov_init_scale_factor: f32,
 
+    #[arg(long, default_value = "false")]
+    pub init_scales_with_knn: bool,
+
     /// Opacity given to Gaussians on initialization
     #[arg(long, default_value = "0.9")]
     pub cov_init_opacity: f32,
@@ -76,11 +79,11 @@ pub struct IncrementalTrainConfig {
     pub densify_every: u32,
     pub densify_max_samples: usize,
     pub densify_recip_weighting: bool,
+    pub densify_ssim_threshold: f32,
     pub densify_scale_mode: DensifyScaleMode,
     pub densify_const_cov_scale: f32,
     pub single_view_train_steps: u32,
     pub lr_mean: f64,
-    pub lr_mean_end: f64,
     pub mean_noise_weight: f32,
     pub lr_coeffs_dc: f64,
     pub lr_coeffs_sh_scale: f32,
