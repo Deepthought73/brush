@@ -1,7 +1,9 @@
 use crate::ffi::{CameraModelId, StampedPose};
 use anyhow::{Context, ensure};
 use brush_app::ui::app::App;
-use brush_incremental::IncrementalTrainMessage::{ContinueTrain, ExternalPoseUpdate, NewView};
+use brush_incremental::IncrementalTrainMessage::{
+    ComputeUnreconstructedArea, ExternalPoseUpdate, NewView,
+};
 use brush_incremental::config::IncrementalProcessConfig;
 use brush_incremental::{
     IncrementalTrainMessage, IncrementalTrainerCreationContext, ViewData,
@@ -16,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use std::{fs, mem};
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 mod gpu_mutex;
 use gpu_mutex::{GpuMutex, GpuMutexGuard, new_gpu_mutex};
@@ -48,6 +50,14 @@ mod ffi {
             gpu_mutex: Box<GpuMutex>,
         ) -> Result<Box<BrushBridge>>;
 
+        fn compute_unreconstructed_area(
+            &self,
+            translation: [f32; 3],
+            quat: [f32; 4],
+            img_w: u32,
+            img_h: u32,
+        ) -> f32;
+
         unsafe fn add_view_to_splat(
             &mut self,
             frame_id: i64,
@@ -58,8 +68,6 @@ mod ffi {
             is_eval: bool,
             is_host_frame: bool,
         );
-
-        fn continue_train(&mut self);
 
         fn update_poses(&mut self, new_poses: Vec<StampedPose>);
 
@@ -129,6 +137,27 @@ fn new_brush_bridge(
 }
 
 impl BrushBridge {
+    fn compute_unreconstructed_area(
+        &self,
+        translation: [f32; 3],
+        quat: [f32; 4],
+        img_w: u32,
+        img_h: u32,
+    ) -> f32 {
+        self.runtime.block_on(async {
+            let (result_sender, result_receiver) = oneshot::channel();
+            self.message_sender
+                .send(ComputeUnreconstructedArea {
+                    camera: self.build_camera(translation, quat),
+                    img_resolution: glam::UVec2::new(img_w, img_h),
+                    result_sender,
+                })
+                .unwrap();
+
+            result_receiver.await.unwrap()
+        })
+    }
+
     fn add_view_to_splat(
         &mut self,
         frame_id: i64,
@@ -139,25 +168,12 @@ impl BrushBridge {
         is_eval: bool,
         is_host_frame: bool,
     ) {
-        let image = unsafe { self.copy_into_rgba_image(image_ptr) };
-
-        let depth = if depth_ptr.is_null() {
-            None
-        } else {
-            // TODO try to pass depth data as shared_ptr to avoid copy
-            let pixel_count = (self.img_width * self.img_height) as usize;
-            let depth_slice = unsafe { std::slice::from_raw_parts(depth_ptr, pixel_count) };
-            Some(depth_slice.to_vec())
-        };
-
-        let quat = glam::Quat::from_xyzw(quat[0], quat[1], quat[2], quat[3]).normalize();
-        let translation = glam::Vec3::new(translation[0], translation[1], translation[2]);
-
-        let mut camera = self.unit_camera.clone();
-        camera.position = translation;
-        camera.rotation = quat;
-
         let start = Instant::now();
+
+        let image = unsafe { self.copy_into_rgba_image(image_ptr) };
+        let depth = self.copy_depth(depth_ptr);
+        let camera = self.build_camera(translation, quat);
+
         self.message_sender
             .send(NewView(ViewData {
                 frame_id,
@@ -169,17 +185,11 @@ impl BrushBridge {
             }))
             .unwrap();
 
-        let add_splats_dur = start.elapsed();
-
         if !is_eval {
-            log::info!("Adding view took: {add_splats_dur:?}, is_host_frame = {is_host_frame:?}");
-        }
-    }
-
-    fn continue_train(&mut self) {
-        let error = self.message_sender.send(ContinueTrain).is_err();
-        if error {
-            return;
+            log::info!(
+                "Adding view took: {:?}, is_host_frame = {is_host_frame:?}",
+                start.elapsed()
+            );
         }
     }
 
@@ -269,6 +279,26 @@ impl BrushBridge {
         DynamicImage::ImageRgba8(
             image::RgbaImage::from_raw(self.img_width, self.img_height, rgba_bytes).unwrap(),
         )
+    }
+
+    fn build_camera(&self, translation: [f32; 3], quat: [f32; 4]) -> Camera {
+        let quat = glam::Quat::from_xyzw(quat[0], quat[1], quat[2], quat[3]).normalize();
+        let translation = glam::Vec3::new(translation[0], translation[1], translation[2]);
+        let mut camera = self.unit_camera.clone();
+        camera.position = translation;
+        camera.rotation = quat;
+        camera
+    }
+
+    fn copy_depth(&self, depth_ptr: *const f32) -> Option<Vec<f32>> {
+        if depth_ptr.is_null() {
+            None
+        } else {
+            // TODO try to pass depth data as shared_ptr to avoid copy
+            let pixel_count = (self.img_width * self.img_height) as usize;
+            let depth_slice = unsafe { std::slice::from_raw_parts(depth_ptr, pixel_count) };
+            Some(depth_slice.to_vec())
+        }
     }
 }
 

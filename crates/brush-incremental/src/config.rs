@@ -74,7 +74,7 @@ pub struct IncrementalProcessConfig {
 #[serde(rename_all = "kebab-case")]
 pub struct IncrementalTrainConfig {
     pub view_sampling_strategy: String,
-    pub all_view_train_steps: u32,
+    pub all_view_train_secs: f64,
 
     pub densify_every: u32,
     pub densify_max_samples: usize,

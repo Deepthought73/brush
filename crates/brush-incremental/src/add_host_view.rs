@@ -28,6 +28,8 @@ const TRAINER_BOUNDING_BOX: BoundingBox = BoundingBox {
 
 impl IncrementalTrainer {
     pub async fn add_host_view(&mut self, view: &ViewData) {
+        let _guard = self.gpu_mutex.lock_arc();
+
         let w = view.image.width() as usize;
         let h = view.image.height() as usize;
         let mut added_depth_values = vec![false; w * h];
@@ -82,6 +84,8 @@ impl IncrementalTrainer {
             let (new_diff, _) = trainer.step_prepared(gt, diff_splats).await;
             self.splats = Some(new_diff.valid());
         }
+
+        self.trainer = None;
     }
 
     async fn add_with_occupancy_grid(&mut self, view: &ViewData, added: &mut [bool]) {
@@ -342,6 +346,8 @@ impl IncrementalTrainer {
             None => new_splat,
             Some(existing) => concat_splats(&existing, &new_splat, render_mode),
         });
+
+        self.trainer = None;
     }
 
     fn build_scene_batch(&self, view: &ViewData) -> SceneBatch {

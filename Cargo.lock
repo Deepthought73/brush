@@ -1034,6 +1034,7 @@ dependencies = [
  "brush-train",
  "brush-vfs",
  "burn",
+ "bytemuck",
  "clap",
  "dashmap",
  "getrandom 0.4.2",

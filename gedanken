@@ -27,3 +27,11 @@
     - improve depth smoothing/filtering
     - use landmarks to improve depth
     - look into possible memory leak of foundation stereo
+
+
+
+
+- Eval ideas:
+    - search for papers doing our thing
+
+    - run VIGS

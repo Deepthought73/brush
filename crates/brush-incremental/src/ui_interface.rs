@@ -1,26 +1,46 @@
 use crate::{IncrementalTrainer, ViewData};
+use async_fn_stream::TryStreamEmitter;
 use brush_dataset::Dataset;
 use brush_dataset::load_image::LoadImage;
 use brush_dataset::scene::SceneView;
 use brush_process::config::TrainStreamConfig;
 use brush_process::message::{ProcessMessage, TrainMessage};
-use brush_render::camera::Camera;
+use brush_process::slot::SlotSender;
+use brush_render::Splats;
 use brush_vfs::BrushVfs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub struct UpdateUiContext {
+    pub emitter: TryStreamEmitter<ProcessMessage, anyhow::Error>,
+    pub splat_sender: SlotSender<Splats>,
+    pub splat_sender_initialized: bool,
+}
+
+impl UpdateUiContext {
+    pub fn new(
+        emitter: TryStreamEmitter<ProcessMessage, anyhow::Error>,
+        splat_sender: SlotSender<Splats>,
+    ) -> Self {
+        Self {
+            emitter,
+            splat_sender,
+            splat_sender_initialized: false,
+        }
+    }
+}
+
 impl IncrementalTrainer {
     pub async fn update_splat_in_ui(&mut self) {
         if let Some(splats) = &self.splats
-            && let Some(splat_sender) = &self.splat_sender
-            && let Some(emitter) = &self.emitter
+            && let Some(ctx) = &mut self.ui_ctx
         {
-            splat_sender.set(0, splats.clone());
-            if !self.splat_sender_initialized {
-                self.splat_sender_initialized = true;
-                emitter.emit(ProcessMessage::DoneLoading).await;
+            ctx.splat_sender.set(0, splats.clone());
+            if !ctx.splat_sender_initialized {
+                ctx.splat_sender_initialized = true;
+                ctx.emitter.emit(ProcessMessage::DoneLoading).await;
             }
-            emitter
+            ctx.emitter
                 .emit(ProcessMessage::SplatsUpdated {
                     up_axis: self.up_axis,
                     frame: 0,
@@ -32,10 +52,10 @@ impl IncrementalTrainer {
         }
     }
 
-    pub async fn init_ui(&mut self) {
-        if let Some(emitter) = &self.emitter {
-            emitter.emit(ProcessMessage::NewProcess).await;
-            emitter
+    pub async fn init_ui(&self) {
+        if let Some(ctx) = &self.ui_ctx {
+            ctx.emitter.emit(ProcessMessage::NewProcess).await;
+            ctx.emitter
                 .emit(ProcessMessage::StartLoading {
                     name: "incremental".to_owned(),
                     source: brush_vfs::DataSource::Path("incremental".to_owned()),
@@ -43,7 +63,7 @@ impl IncrementalTrainer {
                     base_path: None,
                 })
                 .await;
-            emitter
+            ctx.emitter
                 .emit(ProcessMessage::TrainMessage(TrainMessage::TrainConfig {
                     config: Box::new(TrainStreamConfig::default()),
                 }))
@@ -51,26 +71,12 @@ impl IncrementalTrainer {
         }
     }
 
-    pub fn update_up_axis(&mut self, camera: &Camera) {
-        if self.emitter.is_some() && self.train_views.len() + self.eval_views.len() < 50 {
-            let rot = glam::Mat3::from_quat(camera.rotation);
-            if self.up_axis.is_none() {
-                self.up_axis = Some(rot.y_axis);
-            } else if let Some(up_axis) = self.up_axis.as_mut() {
-                *up_axis *= self.up_axis_factor_count;
-                *up_axis += rot.y_axis;
-                *up_axis = up_axis.normalize();
-            }
-            self.up_axis_factor_count += 1.;
-        }
-    }
-
     pub async fn update_ui_dataset(&self) {
-        if let Some(emitter) = &self.emitter {
+        if let Some(ctx) = &self.ui_ctx {
             let train_views = collect_scene_views(self.train_views.iter());
             let eval_views = collect_scene_views(self.eval_views.iter());
 
-            emitter
+            ctx.emitter
                 .emit(ProcessMessage::TrainMessage(TrainMessage::Dataset {
                     dataset: Dataset::from_views(train_views, eval_views),
                 }))
@@ -78,13 +84,13 @@ impl IncrementalTrainer {
         }
     }
 
-    pub async fn update_train_status_ui(&mut self) {
-        if let Some(emitter) = &self.emitter {
+    pub async fn update_train_status_ui(&self) {
+        if let Some(ctx) = &self.ui_ctx {
             let (num_splats, sh) = self
                 .splats
                 .as_ref()
                 .map_or((0, 0), |it| (it.num_splats(), it.sh_degree()));
-            emitter
+            ctx.emitter
                 .emit(ProcessMessage::SplatsUpdated {
                     up_axis: None,
                     frame: 0,
@@ -93,11 +99,23 @@ impl IncrementalTrainer {
                     sh_degree: sh,
                 })
                 .await;
-            emitter
+            ctx.emitter
                 .emit(ProcessMessage::TrainMessage(TrainMessage::TrainStep {
                     iter: 0,
-                    total_elapsed: self.training_start.unwrap().elapsed(),
+                    total_elapsed: self.training_duration(),
                     lod_progress: None,
+                }))
+                .await;
+        }
+    }
+
+    pub async fn update_eval_ui(&self, avg_psnr: f32, avg_ssim: f32) {
+        if let Some(ctx) = &self.ui_ctx {
+            ctx.emitter
+                .emit(ProcessMessage::TrainMessage(TrainMessage::EvalResult {
+                    iter: 0,
+                    avg_psnr,
+                    avg_ssim,
                 }))
                 .await;
         }

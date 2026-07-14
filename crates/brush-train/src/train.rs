@@ -202,7 +202,7 @@ impl SplatTrainer {
     /// training views. No-op unless `config.pose_opt` is set. Call once after
     /// [`SplatTrainer::new`] (and after each LOD-phase rebuild).
     pub fn enable_pose_opt(&mut self, num_views: usize, device: &Device) {
-        if self.config.pose_opt && num_views > 0 {
+        if num_views > 0 {
             self.pose_opt = Some(PoseOptimizer::new(num_views, &self.config, device));
         }
     }

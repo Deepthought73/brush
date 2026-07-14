@@ -1,14 +1,16 @@
-use crate::IncrementalTrainMessage::{ExternalPoseUpdate, NewView};
+use crate::IncrementalTrainMessage::{ComputeUnreconstructedArea, ExternalPoseUpdate, NewView};
 use crate::config::IncrementalProcessConfig;
+use crate::ui_interface::UpdateUiContext;
 use crate::view_sampling::{ViewSampler, create_view_sampler};
-use IncrementalTrainMessage::ContinueTrain;
+use IncrementalTrainMessage::{Eval, Train};
 use anyhow::Context;
-use async_fn_stream::{TryStreamEmitter, try_fn_stream};
-use brush_process::message::{ProcessMessage, TrainMessage};
-use brush_process::slot::SlotSender;
+use async_fn_stream::try_fn_stream;
 use brush_process::{RunningProcess, slot, wait_for_device};
-use brush_render::{AlphaMode, camera::Camera, gaussian_splats::Splats};
+use brush_render::{
+    AlphaMode, TextureMode, camera::Camera, gaussian_splats::Splats, render_splats,
+};
 use brush_train::eval::eval_stats;
+use brush_train::train::SplatTrainer;
 use image::DynamicImage;
 use parking_lot::Mutex;
 use rand::SeedableRng;
@@ -16,8 +18,9 @@ use rand::rngs::StdRng;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::mpsc;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::{mpsc, oneshot};
 
 mod add_host_view;
 mod all_view_training;
@@ -29,9 +32,15 @@ mod view_sampling;
 pub type FrameId = i64;
 
 pub enum IncrementalTrainMessage {
+    ComputeUnreconstructedArea {
+        camera: Camera,
+        img_resolution: glam::UVec2,
+        result_sender: oneshot::Sender<f32>,
+    },
     NewView(ViewData),
     ExternalPoseUpdate(Vec<(FrameId, glam::Vec3, glam::Quat)>),
-    ContinueTrain,
+    Train,
+    Eval(oneshot::Sender<(f32, f32)>),
 }
 
 pub struct ViewData {
@@ -58,15 +67,14 @@ pub struct IncrementalTrainerCreationContext {
 pub fn create_incremental_training_process(
     cc: IncrementalTrainerCreationContext,
 ) -> RunningProcess {
-    let (splat_tx, splat_view) = slot::channel();
+    let (splat_sender, splat_view) = slot::channel();
 
     let stream = try_fn_stream(|emitter| async move {
         let mut trainer = IncrementalTrainer::new(
             cc.message_receiver,
             cc.gpu_mutex,
-            Some(splat_tx),
-            Some(emitter),
             cc.config,
+            Some(UpdateUiContext::new(emitter, splat_sender)),
         )
         .await;
         trainer.init_ui().await;
@@ -85,7 +93,7 @@ pub async fn run_incremental_training_headless(
     brush_process::burn_init_setup().await;
 
     let mut trainer =
-        IncrementalTrainer::new(cc.message_receiver, cc.gpu_mutex, None, None, cc.config).await;
+        IncrementalTrainer::new(cc.message_receiver, cc.gpu_mutex, cc.config, None).await;
 
     trainer.run().await?;
 
@@ -101,6 +109,7 @@ pub struct IncrementalTrainer {
     train_views: Vec<ViewData>,
     eval_views: Vec<ViewData>,
 
+    trainer: Option<SplatTrainer>,
     view_sampler: Box<dyn ViewSampler>,
     rng: StdRng,
 
@@ -112,21 +121,18 @@ pub struct IncrementalTrainer {
 
     device: burn::tensor::Device,
 
-    // communication with ui
-    emitter: Option<TryStreamEmitter<ProcessMessage, anyhow::Error>>,
-    splat_sender: Option<SlotSender<Splats>>,
-    splat_sender_initialized: bool,
     up_axis: Option<glam::Vec3>,
     up_axis_factor_count: f32,
+
+    ui_ctx: Option<UpdateUiContext>,
 }
 
 impl IncrementalTrainer {
     async fn new(
         message_receiver: mpsc::UnboundedReceiver<IncrementalTrainMessage>,
         gpu_mutex: Arc<Mutex<()>>,
-        splat_sender: Option<SlotSender<Splats>>,
-        emitter: Option<TryStreamEmitter<ProcessMessage, anyhow::Error>>,
         config: IncrementalProcessConfig,
+        ui_ctx: Option<UpdateUiContext>,
     ) -> Self {
         let device: burn::tensor::Device = wait_for_device().await.clone().into();
         device.seed(config.seed);
@@ -142,62 +148,58 @@ impl IncrementalTrainer {
             eval_frame_id_to_idx: Default::default(),
             train_views: Default::default(),
             eval_views: Default::default(),
-            splat_sender,
             splats: None,
             training_start: None,
-            emitter,
             config,
             corresponding_splats: Default::default(),
             device,
-            up_axis: None,
-            splat_sender_initialized: false,
-            up_axis_factor_count: 0.0,
             view_sampler,
             rng,
+            trainer: None,
+            up_axis: None,
+            up_axis_factor_count: 0.0,
+            ui_ctx,
         }
     }
 
     async fn run(&mut self) -> anyhow::Result<()> {
         log::info!("Start training thread");
 
-        let mut eval_count = 0.0;
+        self.training_start = Some(Instant::now());
 
         loop {
-            match self.message_receiver.recv().await {
-                Some(message) => match message {
+            match self.receive_message().await {
+                Ok(message) => match message {
+                    ComputeUnreconstructedArea {
+                        camera,
+                        img_resolution,
+                        result_sender,
+                    } => {
+                        let res = self
+                            .compute_unreconstructed_area(&camera, img_resolution)
+                            .await;
+                        result_sender.send(res).unwrap();
+                    }
                     NewView(view_data) => {
                         self.update_up_axis(&view_data.camera);
-                        {
-                            let _guard = self.gpu_mutex.lock_arc();
-                            self.add_view(view_data).await;
-                        }
+                        self.add_view(view_data).await;
                     }
                     ExternalPoseUpdate(new_poses) => {
                         self.update_poses(new_poses).await;
-                        continue;
                     }
-                    ContinueTrain => {}
+                    Train => self.train().await,
+                    Eval(result_sender) => {
+                        let (psnr, ssim) = self.eval(self.config.eval_train_views).await?;
+
+                        if self.config.export_on_eval {
+                            self.export_checkpoint().await?;
+                        }
+
+                        result_sender.send((psnr, ssim)).unwrap();
+                    }
                 },
-                None => break,
-            }
-
-            let training_secs = self.training_secs();
-
-            {
-                let _guard = self.gpu_mutex.lock_arc();
-                self.train().await;
-            }
-
-            if let Some(eval_every) = self.config.eval_every_sec
-                && training_secs >= eval_every * eval_count
-            {
-                self.eval(self.config.eval_train_views).await?;
-
-                if self.config.export_on_eval {
-                    self.export_checkpoint().await?;
-                }
-
-                eval_count += 1.0;
+                Err(TryRecvError::Empty) => self.train().await,
+                Err(TryRecvError::Disconnected) => break,
             }
 
             self.update_ui_dataset().await;
@@ -210,6 +212,17 @@ impl IncrementalTrainer {
         log::info!("Finish training thread");
 
         Ok(())
+    }
+
+    async fn receive_message(&mut self) -> Result<IncrementalTrainMessage, TryRecvError> {
+        if self.splats.is_none() {
+            self.message_receiver
+                .recv()
+                .await
+                .ok_or_else(|| TryRecvError::Disconnected)
+        } else {
+            self.message_receiver.try_recv()
+        }
     }
 
     async fn add_view(&mut self, view_data: ViewData) {
@@ -228,7 +241,39 @@ impl IncrementalTrainer {
         }
     }
 
-    async fn eval(&self, eval_train: bool) -> anyhow::Result<()> {
+    async fn compute_unreconstructed_area(
+        &mut self,
+        camera: &Camera,
+        img_resolution: glam::UVec2,
+    ) -> f32 {
+        if self.splats.is_none() {
+            return 1.0;
+        }
+
+        let (img, _) = render_splats(
+            self.splats.clone().unwrap(),
+            camera,
+            img_resolution,
+            glam::Vec3::ZERO,
+            None,
+            TextureMode::Packed,
+        )
+        .await;
+
+        let floats = img
+            .into_data_async()
+            .await
+            .unwrap()
+            .into_vec::<f32>()
+            .unwrap();
+        let packed: &[u32] = bytemuck::cast_slice(&floats);
+
+
+        let empty = packed.iter().filter(|&&p| p >> 24 <= 5).count();
+        empty as f32 / packed.len() as f32
+    }
+
+    async fn eval(&mut self, eval_train: bool) -> anyhow::Result<(f32, f32)> {
         if let Some(splats) = self.splats.clone() {
             let mut psnr_sum = 0.;
             let mut ssim_sum = 0.;
@@ -241,7 +286,7 @@ impl IncrementalTrainer {
             let num_views = views.len();
 
             if num_views == 0 {
-                return Ok(());
+                return Ok((0., 0.));
             }
 
             for view in views {
@@ -260,30 +305,24 @@ impl IncrementalTrainer {
             let psnr = psnr_sum / num_views as f32;
             let ssim = ssim_sum / num_views as f32;
 
-            if let Some(emitter) = &self.emitter {
-                emitter
-                    .emit(ProcessMessage::TrainMessage(TrainMessage::EvalResult {
-                        iter: 0,
-                        avg_psnr: psnr,
-                        avg_ssim: ssim,
-                    }))
-                    .await;
-            }
+            self.update_eval_ui(psnr, ssim).await;
 
             log::info!(
                 "Train time: {:.2}, Eval views: {num_views}, PSNR: {}, SSIM: {}",
-                self.training_start.unwrap().elapsed().as_secs_f64(),
+                self.training_duration().as_secs_f64(),
                 psnr,
                 ssim
             );
-        }
 
-        Ok(())
+            Ok((psnr, ssim))
+        } else {
+            Ok((0., 0.))
+        }
     }
 
-    async fn export_checkpoint(&self) -> Result<(), anyhow::Error> {
+    async fn export_checkpoint(&mut self) -> Result<(), anyhow::Error> {
         if let Some(splats) = self.splats.clone() {
-            let secs = self.training_start.unwrap().elapsed().as_millis();
+            let secs = self.training_duration().as_millis();
             let num_splats = splats.num_splats();
 
             let export_path = PathBuf::from(&self.config.export_path);
@@ -303,8 +342,21 @@ impl IncrementalTrainer {
         Ok(())
     }
 
-    fn training_secs(&mut self) -> f64 {
-        let training_start = self.training_start.get_or_insert(Instant::now());
-        training_start.elapsed().as_secs_f64()
+    fn update_up_axis(&mut self, camera: &Camera) {
+        if self.train_views.len() + self.eval_views.len() < 50 {
+            let rot = glam::Mat3::from_quat(camera.rotation);
+            if self.up_axis.is_none() {
+                self.up_axis = Some(rot.y_axis);
+            } else if let Some(up_axis) = &mut self.up_axis {
+                *up_axis *= self.up_axis_factor_count;
+                *up_axis += rot.y_axis;
+                *up_axis = up_axis.normalize();
+            }
+            self.up_axis_factor_count += 1.;
+        }
+    }
+
+    fn training_duration(&self) -> Duration {
+        self.training_start.unwrap().elapsed()
     }
 }

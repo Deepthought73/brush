@@ -34,6 +34,7 @@ brush-dataset = { path = "../brush-dataset"}
 
 dashmap = "6.2.1"
 rayon.workspace = true
+bytemuck.workspace = true
 
 parking_lot.workspace = true
 
