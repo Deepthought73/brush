@@ -1,4 +1,6 @@
-use crate::IncrementalTrainMessage::{ComputeUnreconstructedArea, ExternalPoseUpdate, NewView};
+use crate::IncrementalTrainMessage::{
+    ComputeSSIM, ComputeUnreconstructedArea, ExternalPoseUpdate, NewView,
+};
 use crate::config::IncrementalProcessConfig;
 use crate::ui_interface::UpdateUiContext;
 use crate::view_sampling::{ViewSampler, create_view_sampler};
@@ -9,7 +11,7 @@ use brush_process::{RunningProcess, slot, wait_for_device};
 use brush_render::{
     AlphaMode, TextureMode, camera::Camera, gaussian_splats::Splats, render_splats,
 };
-use brush_train::eval::eval_stats;
+use brush_train::eval::{eval_stats, ssim_map};
 use brush_train::train::SplatTrainer;
 use image::DynamicImage;
 use parking_lot::Mutex;
@@ -35,6 +37,11 @@ pub enum IncrementalTrainMessage {
     ComputeUnreconstructedArea {
         camera: Camera,
         img_resolution: glam::UVec2,
+        result_sender: oneshot::Sender<f32>,
+    },
+    ComputeSSIM {
+        camera: Camera,
+        gt_img: DynamicImage,
         result_sender: oneshot::Sender<f32>,
     },
     NewView(ViewData),
@@ -180,6 +187,14 @@ impl IncrementalTrainer {
                             .await;
                         result_sender.send(res).unwrap();
                     }
+                    ComputeSSIM {
+                        camera,
+                        gt_img,
+                        result_sender,
+                    } => {
+                        let res = self.compute_ssim(&camera, gt_img).await;
+                        result_sender.send(res).unwrap();
+                    }
                     NewView(view_data) => {
                         self.update_up_axis(&view_data.camera);
                         self.add_view(view_data).await;
@@ -235,7 +250,9 @@ impl IncrementalTrainer {
             self.train_frame_id_to_idx
                 .insert(view_data.frame_id, self.train_views.len());
             if view_data.is_host_frame {
+                let start = Instant::now();
                 self.add_host_view(&view_data).await;
+                log::info!("Adding host view took: {:?}", start.elapsed());
             }
             self.train_views.push(view_data);
         }
@@ -268,9 +285,27 @@ impl IncrementalTrainer {
             .unwrap();
         let packed: &[u32] = bytemuck::cast_slice(&floats);
 
-
         let empty = packed.iter().filter(|&&p| p >> 24 <= 5).count();
         empty as f32 / packed.len() as f32
+    }
+
+    async fn compute_ssim(&mut self, camera: &Camera, gt_img: DynamicImage) -> f32 {
+        if self.splats.is_none() {
+            return -1.0;
+        }
+
+        ssim_map(
+            self.splats.clone().unwrap(),
+            camera,
+            gt_img,
+            AlphaMode::Masked,
+            &self.device,
+        )
+        .await
+        .mean()
+        .into_scalar_async::<f32>()
+        .await
+        .unwrap()
     }
 
     async fn eval(&mut self, eval_train: bool) -> anyhow::Result<(f32, f32)> {

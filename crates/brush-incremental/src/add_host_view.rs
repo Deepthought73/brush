@@ -68,11 +68,7 @@ impl IncrementalTrainer {
         for step in 1..=train_config.total_train_iters {
             if step.is_multiple_of(self.config.train_config.densify_every) {
                 self.densify(view, added_depth_values).await;
-                trainer = SplatTrainer::new(
-                    &self.single_view_train_config(),
-                    &self.device,
-                    TRAINER_BOUNDING_BOX,
-                );
+                trainer = SplatTrainer::new(&train_config, &self.device, TRAINER_BOUNDING_BOX);
             }
 
             let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(

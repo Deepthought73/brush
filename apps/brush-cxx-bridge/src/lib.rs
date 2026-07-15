@@ -1,8 +1,8 @@
-use crate::ffi::{CameraModelId, StampedPose};
+use crate::ffi::{CameraModelId, EvalResult, StampedPose};
 use anyhow::{Context, ensure};
 use brush_app::ui::app::App;
 use brush_incremental::IncrementalTrainMessage::{
-    ComputeUnreconstructedArea, ExternalPoseUpdate, NewView,
+    ComputeSSIM, ComputeUnreconstructedArea, Eval, ExternalPoseUpdate, NewView,
 };
 use brush_incremental::config::IncrementalProcessConfig;
 use brush_incremental::{
@@ -15,7 +15,6 @@ use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use image::DynamicImage;
 use std::fs::File;
 use std::path::PathBuf;
-use std::time::Instant;
 use std::{fs, mem};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
@@ -37,6 +36,11 @@ mod ffi {
         q: [f32; 4],
     }
 
+    struct EvalResult {
+        psnr: f32,
+        ssim: f32,
+    }
+
     extern "Rust" {
         type BrushBridge;
 
@@ -50,13 +54,16 @@ mod ffi {
             gpu_mutex: Box<GpuMutex>,
         ) -> Result<Box<BrushBridge>>;
 
-        fn compute_unreconstructed_area(
+        fn compute_unreconstructed_area(&self, translation: [f32; 3], quat: [f32; 4]) -> f32;
+
+        unsafe fn compute_ssim(
             &self,
             translation: [f32; 3],
             quat: [f32; 4],
-            img_w: u32,
-            img_h: u32,
+            image_ptr: *const u16,
         ) -> f32;
+
+        fn eval(&self) -> EvalResult;
 
         unsafe fn add_view_to_splat(
             &mut self,
@@ -137,25 +144,39 @@ fn new_brush_bridge(
 }
 
 impl BrushBridge {
-    fn compute_unreconstructed_area(
-        &self,
-        translation: [f32; 3],
-        quat: [f32; 4],
-        img_w: u32,
-        img_h: u32,
-    ) -> f32 {
-        self.runtime.block_on(async {
-            let (result_sender, result_receiver) = oneshot::channel();
-            self.message_sender
-                .send(ComputeUnreconstructedArea {
-                    camera: self.build_camera(translation, quat),
-                    img_resolution: glam::UVec2::new(img_w, img_h),
-                    result_sender,
-                })
-                .unwrap();
+    fn compute_unreconstructed_area(&self, translation: [f32; 3], quat: [f32; 4]) -> f32 {
+        let (result_sender, result_receiver) = oneshot::channel();
+        self.message_sender
+            .send(ComputeUnreconstructedArea {
+                camera: self.build_camera(translation, quat),
+                img_resolution: glam::UVec2::new(self.img_width, self.img_height),
+                result_sender,
+            })
+            .unwrap();
 
-            result_receiver.await.unwrap()
-        })
+        self.runtime.block_on(result_receiver).unwrap()
+    }
+
+    fn compute_ssim(&self, translation: [f32; 3], quat: [f32; 4], image_ptr: *const u16) -> f32 {
+        let gt_img = unsafe { self.copy_into_rgba_image(image_ptr) };
+
+        let (result_sender, result_receiver) = oneshot::channel();
+        self.message_sender
+            .send(ComputeSSIM {
+                camera: self.build_camera(translation, quat),
+                gt_img,
+                result_sender,
+            })
+            .unwrap();
+
+        self.runtime.block_on(result_receiver).unwrap()
+    }
+
+    fn eval(&self) -> EvalResult {
+        let (tx, rx) = oneshot::channel();
+        self.message_sender.send(Eval(tx)).unwrap();
+        let (psnr, ssim) = self.runtime.block_on(rx).unwrap();
+        EvalResult { psnr, ssim }
     }
 
     fn add_view_to_splat(
@@ -168,8 +189,6 @@ impl BrushBridge {
         is_eval: bool,
         is_host_frame: bool,
     ) {
-        let start = Instant::now();
-
         let image = unsafe { self.copy_into_rgba_image(image_ptr) };
         let depth = self.copy_depth(depth_ptr);
         let camera = self.build_camera(translation, quat);
@@ -184,13 +203,6 @@ impl BrushBridge {
                 is_host_frame,
             }))
             .unwrap();
-
-        if !is_eval {
-            log::info!(
-                "Adding view took: {:?}, is_host_frame = {is_host_frame:?}",
-                start.elapsed()
-            );
-        }
     }
 
     fn update_poses(&mut self, new_poses: Vec<StampedPose>) {
@@ -204,13 +216,9 @@ impl BrushBridge {
                 )
             })
             .collect::<Vec<_>>();
-        let error = self
-            .message_sender
+        self.message_sender
             .send(ExternalPoseUpdate(new_poses))
-            .is_err();
-        if error {
-            return;
-        }
+            .unwrap();
     }
 
     fn run(&mut self) -> anyhow::Result<()> {
