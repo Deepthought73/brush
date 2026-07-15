@@ -1,11 +1,7 @@
-use crate::IncrementalTrainMessage::{
-    ComputeSSIM, ComputeUnreconstructedArea, ExternalPoseUpdate, NewView,
-};
+use crate::IncrementalTrainMessage::*;
 use crate::config::IncrementalProcessConfig;
 use crate::ui_interface::UpdateUiContext;
 use crate::view_sampling::{ViewSampler, create_view_sampler};
-use IncrementalTrainMessage::{Eval, Train};
-use anyhow::Context;
 use async_fn_stream::try_fn_stream;
 use brush_process::{RunningProcess, slot, wait_for_device};
 use brush_render::{
@@ -17,8 +13,8 @@ use image::DynamicImage;
 use parking_lot::Mutex;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand_distr::num_traits::Zero;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
@@ -27,6 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 mod add_host_view;
 mod all_view_training;
 pub mod config;
+mod export;
 mod pose_update;
 mod ui_interface;
 mod view_sampling;
@@ -34,20 +31,17 @@ mod view_sampling;
 pub type FrameId = i64;
 
 pub enum IncrementalTrainMessage {
-    ComputeUnreconstructedArea {
+    ComputeUnreconstructedAreaAndSSIM {
         camera: Camera,
         img_resolution: glam::UVec2,
-        result_sender: oneshot::Sender<f32>,
-    },
-    ComputeSSIM {
-        camera: Camera,
         gt_img: DynamicImage,
-        result_sender: oneshot::Sender<f32>,
+        result_sender: oneshot::Sender<(f32, f32)>,
     },
     NewView(ViewData),
     ExternalPoseUpdate(Vec<(FrameId, glam::Vec3, glam::Quat)>),
     Train,
     Eval(oneshot::Sender<(f32, f32)>),
+    Stop,
 }
 
 pub struct ViewData {
@@ -69,6 +63,7 @@ pub struct IncrementalTrainerCreationContext {
     pub message_receiver: mpsc::UnboundedReceiver<IncrementalTrainMessage>,
     pub gpu_mutex: Arc<Mutex<()>>,
     pub config: IncrementalProcessConfig,
+    pub r_unrectified_rectified: glam::Quat,
 }
 
 pub fn create_incremental_training_process(
@@ -81,6 +76,7 @@ pub fn create_incremental_training_process(
             cc.message_receiver,
             cc.gpu_mutex,
             cc.config,
+            cc.r_unrectified_rectified,
             Some(UpdateUiContext::new(emitter, splat_sender)),
         )
         .await;
@@ -99,8 +95,14 @@ pub async fn run_incremental_training_headless(
 ) -> anyhow::Result<()> {
     brush_process::burn_init_setup().await;
 
-    let mut trainer =
-        IncrementalTrainer::new(cc.message_receiver, cc.gpu_mutex, cc.config, None).await;
+    let mut trainer = IncrementalTrainer::new(
+        cc.message_receiver,
+        cc.gpu_mutex,
+        cc.config,
+        cc.r_unrectified_rectified,
+        None,
+    )
+    .await;
 
     trainer.run().await?;
 
@@ -123,13 +125,15 @@ pub struct IncrementalTrainer {
     training_start: Option<Instant>,
     splats: Option<Splats>,
     config: IncrementalProcessConfig,
+    host_view_count: usize,
+    export_count: f64,
+    r_unrectified_rectified: glam::Quat,
 
     corresponding_splats: HashMap<FrameId, (usize, usize)>,
 
     device: burn::tensor::Device,
 
     up_axis: Option<glam::Vec3>,
-    up_axis_factor_count: f32,
 
     ui_ctx: Option<UpdateUiContext>,
 }
@@ -139,6 +143,7 @@ impl IncrementalTrainer {
         message_receiver: mpsc::UnboundedReceiver<IncrementalTrainMessage>,
         gpu_mutex: Arc<Mutex<()>>,
         config: IncrementalProcessConfig,
+        r_unrectified_rectified: glam::Quat,
         ui_ctx: Option<UpdateUiContext>,
     ) -> Self {
         let device: burn::tensor::Device = wait_for_device().await.clone().into();
@@ -164,36 +169,30 @@ impl IncrementalTrainer {
             rng,
             trainer: None,
             up_axis: None,
-            up_axis_factor_count: 0.0,
             ui_ctx,
+            host_view_count: 0,
+            export_count: 1.0,
+            r_unrectified_rectified,
         }
     }
 
     async fn run(&mut self) -> anyhow::Result<()> {
         log::info!("Start training thread");
 
-        self.training_start = Some(Instant::now());
-
         loop {
             match self.receive_message().await {
                 Ok(message) => match message {
-                    ComputeUnreconstructedArea {
+                    ComputeUnreconstructedAreaAndSSIM {
                         camera,
                         img_resolution,
-                        result_sender,
-                    } => {
-                        let res = self
-                            .compute_unreconstructed_area(&camera, img_resolution)
-                            .await;
-                        result_sender.send(res).unwrap();
-                    }
-                    ComputeSSIM {
-                        camera,
                         gt_img,
                         result_sender,
                     } => {
-                        let res = self.compute_ssim(&camera, gt_img).await;
-                        result_sender.send(res).unwrap();
+                        let unreconstructed_area = self
+                            .compute_unreconstructed_area(&camera, img_resolution)
+                            .await;
+                        let ssim = self.compute_ssim(&camera, gt_img).await;
+                        result_sender.send((unreconstructed_area, ssim)).unwrap();
                     }
                     NewView(view_data) => {
                         self.update_up_axis(&view_data.camera);
@@ -205,21 +204,19 @@ impl IncrementalTrainer {
                     Train => self.train().await,
                     Eval(result_sender) => {
                         let (psnr, ssim) = self.eval(self.config.eval_train_views).await?;
-
-                        if self.config.export_on_eval {
-                            self.export_checkpoint().await?;
-                        }
-
                         result_sender.send((psnr, ssim)).unwrap();
                     }
+                    Stop => break,
                 },
                 Err(TryRecvError::Empty) => self.train().await,
                 Err(TryRecvError::Disconnected) => break,
             }
 
+            self.update_splat_in_ui().await;
             self.update_ui_dataset().await;
             self.update_train_status_ui().await;
-            self.update_splat_in_ui().await;
+
+            self.export_all().await?;
 
             brush_async::yield_now().await;
         }
@@ -230,17 +227,25 @@ impl IncrementalTrainer {
     }
 
     async fn receive_message(&mut self) -> Result<IncrementalTrainMessage, TryRecvError> {
-        if self.splats.is_none() {
+        let ret = if self.splats.is_none() || self.config.train_config.all_view_train_secs.is_zero()
+        {
             self.message_receiver
                 .recv()
                 .await
                 .ok_or_else(|| TryRecvError::Disconnected)
         } else {
             self.message_receiver.try_recv()
+        };
+
+        // Training time starts on first message
+        if self.training_start.is_none() {
+            self.training_start = Some(Instant::now());
         }
+
+        ret
     }
 
-    async fn add_view(&mut self, view_data: ViewData) {
+    async fn add_view(&mut self, mut view_data: ViewData) {
         if view_data.is_eval {
             self.eval_frame_id_to_idx
                 .insert(view_data.frame_id, self.eval_views.len());
@@ -250,8 +255,9 @@ impl IncrementalTrainer {
             self.train_frame_id_to_idx
                 .insert(view_data.frame_id, self.train_views.len());
             if view_data.is_host_frame {
+                self.host_view_count += 1;
                 let start = Instant::now();
-                self.add_host_view(&view_data).await;
+                self.add_host_view(&mut view_data).await;
                 log::info!("Adding host view took: {:?}", start.elapsed());
             }
             self.train_views.push(view_data);
@@ -355,39 +361,10 @@ impl IncrementalTrainer {
         }
     }
 
-    async fn export_checkpoint(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(splats) = self.splats.clone() {
-            let secs = self.training_duration().as_millis();
-            let num_splats = splats.num_splats();
-
-            let export_path = PathBuf::from(&self.config.export_path);
-            tokio::fs::create_dir_all(&export_path)
-                .await
-                .with_context(|| format!("Creating export directory {}", export_path.display()))?;
-            let splat_data = brush_serde::splat_to_ply(splats, self.up_axis)
-                .await
-                .context("Serializing splat data")?;
-            tokio::fs::write(
-                export_path.join(format!("{}_{}.ply", secs, num_splats)),
-                splat_data,
-            )
-            .await
-            .context(format!("Failed to export ply {export_path:?}"))?;
-        }
-        Ok(())
-    }
-
     fn update_up_axis(&mut self, camera: &Camera) {
-        if self.train_views.len() + self.eval_views.len() < 50 {
-            let rot = glam::Mat3::from_quat(camera.rotation);
-            if self.up_axis.is_none() {
-                self.up_axis = Some(rot.y_axis);
-            } else if let Some(up_axis) = &mut self.up_axis {
-                *up_axis *= self.up_axis_factor_count;
-                *up_axis += rot.y_axis;
-                *up_axis = up_axis.normalize();
-            }
-            self.up_axis_factor_count += 1.;
+        let rot = glam::Mat3::from_quat(camera.rotation);
+        if self.up_axis.is_none() {
+            self.up_axis = Some(rot.y_axis);
         }
     }
 

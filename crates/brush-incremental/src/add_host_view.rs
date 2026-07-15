@@ -27,8 +27,14 @@ const TRAINER_BOUNDING_BOX: BoundingBox = BoundingBox {
 };
 
 impl IncrementalTrainer {
-    pub async fn add_host_view(&mut self, view: &ViewData) {
+    pub async fn add_host_view(&mut self, view: &mut ViewData) {
         let _guard = self.gpu_mutex.lock_arc();
+
+        if self.config.train_config.initial_pose_opt {
+            let start = Instant::now();
+            self.optimize_view_pose(view).await;
+            log::info!("View pose optimization took {:?}", start.elapsed());
+        }
 
         let w = view.image.width() as usize;
         let h = view.image.height() as usize;
@@ -46,9 +52,7 @@ impl IncrementalTrainer {
             }
         };
 
-        if self.config.train_config.single_view_train_steps > 0 {
-            self.train_view(view, &mut added_depth_values).await;
-        }
+        self.train_view(view, &mut added_depth_values).await;
 
         let splats_after = self.splats.as_ref().unwrap().num_splats() as usize;
 
@@ -59,18 +63,14 @@ impl IncrementalTrainer {
     async fn train_view(&mut self, view: &ViewData, added_depth_values: &mut [bool]) {
         let batch = self.build_scene_batch(view);
 
-        let train_config = self.single_view_train_config();
+        let burst_train_config = self.burst_train_config();
 
-        let mut trainer = SplatTrainer::new(&train_config, &self.device, TRAINER_BOUNDING_BOX);
+        let mut trainer =
+            SplatTrainer::new(&burst_train_config, &self.device, TRAINER_BOUNDING_BOX);
 
         let mut gpu_batch: Option<GpuBatch> = None;
 
-        for step in 1..=train_config.total_train_iters {
-            if step.is_multiple_of(self.config.train_config.densify_every) {
-                self.densify(view, added_depth_values).await;
-                trainer = SplatTrainer::new(&train_config, &self.device, TRAINER_BOUNDING_BOX);
-            }
-
+        for _ in 0..self.config.train_config.densify_at {
             let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(
                 self.splats.as_ref().unwrap().clone(),
             );
@@ -79,6 +79,108 @@ impl IncrementalTrainer {
             });
             let (new_diff, _) = trainer.step_prepared(gt, diff_splats).await;
             self.splats = Some(new_diff.valid());
+        }
+
+        if self.config.train_config.densify_max_samples > 0 {
+            self.densify(view, added_depth_values).await;
+        }
+
+        trainer = SplatTrainer::new(
+            &self.create_all_view_train_config(),
+            &self.device,
+            TRAINER_BOUNDING_BOX,
+        );
+        for _ in 0..self.config.train_config.single_view_train_steps {
+            let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(
+                self.splats.as_ref().unwrap().clone(),
+            );
+            let gt = gpu_batch.get_or_insert_with(|| {
+                GpuBatch::from_scene_batch(batch.clone(), &diff_splats.device())
+            });
+            let (new_diff, _) = trainer.step_prepared(gt, diff_splats).await;
+            self.splats = Some(new_diff.valid());
+        }
+
+        self.trainer = None;
+
+        /* TODO nice for tuning the training params: renders the host view after training on it, maybe make this run optional
+        let (img, _) = render_splats(
+            self.splats.clone().unwrap(),
+            &view.camera,
+            glam::UVec2::new(view.image.width(), view.image.height()),
+            Vec3::ZERO,
+            None,
+            TextureMode::Float,
+        )
+        .await;
+        // Save the final rendered view to disk for inspection. Mirrors the
+        // tensor -> Rgb32FImage -> rgb8 conversion used by `EvalSample::save_to_disk`.
+        let render_rgb = img.slice(s![.., .., 0..3]);
+        let [h, w, _] = render_rgb.dims();
+        let save_result: anyhow::Result<()> = async {
+            let data = render_rgb.into_data_async().await?.into_vec::<f32>()?;
+            let img: image::DynamicImage = image::Rgb32FImage::from_raw(w as u32, h as u32, data)
+                .expect("Rendered tensor must fit an RGB image")
+                .into();
+            let img = img.into_rgb8();
+            let dir = std::path::Path::new("after_single_view_train_render");
+            tokio::fs::create_dir_all(dir).await?;
+            // Name by render timestamp (nanos since the epoch, zero-padded) so
+            // lexicographic filename order matches the order views were rendered.
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = dir.join(format!("{ts:020}.png"));
+            img.save(&path)?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = save_result {
+            log::warn!("Failed to save rendered view {}: {e:?}", view.frame_id);
+        }*/
+    }
+
+    async fn optimize_view_pose(&mut self, view: &mut ViewData) {
+        if self.splats.is_none() || !self.config.train_config.initial_pose_opt {
+            return;
+        }
+
+        // This view isn't in `train_views` yet (it's pushed *after*
+        // `add_host_view` returns), so its global `view_index` would be out of
+        // range for a per-training-view pose optimizer. Optimize it in
+        // isolation instead: a single-view pose optimizer at index 0.
+        let mut batch = self.build_scene_batch(view);
+        batch.view_index = 0;
+
+        let mut train_config = TrainConfig::default();
+        train_config.depth_loss_weight = self.config.train_config.depth_loss_weight;
+        train_config.pose_opt = self.config.train_config.initial_pose_opt;
+        train_config.lr_pose = self.config.train_config.initial_pose_lr_start;
+        train_config.lr_pose_end = self.config.train_config.initial_pose_lr_end;
+
+        let mut trainer = SplatTrainer::new(&train_config, &self.device, TRAINER_BOUNDING_BOX);
+        trainer.enable_pose_opt(1, &self.device);
+
+        // Build the GT on the autodiff device so the depth GT shares a backend
+        // with the (autodiff) rendered depth in `step_pose_only`; the packed
+        // RGB GT is force-moved to the inner backend inside `from_scene_batch`.
+        let device = self.splats.as_ref().unwrap().device().autodiff();
+        let gpu_batch = GpuBatch::from_scene_batch(batch, &device);
+
+        for _ in 0..self.config.train_config.initial_pose_lr_steps {
+            let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(
+                self.splats.as_ref().unwrap().clone(),
+            );
+            trainer.step_pose_only(&gpu_batch, diff_splats).await;
+        }
+
+        let base = vec![view.camera];
+        if let Some(corrected) = trainer.corrected_train_cameras(&base).await {
+            let dist = (corrected[0].position - view.camera.position).length();
+            view.camera = corrected[0];
+
+            log::info!("Moved pose by {:?}", dist);
         }
 
         self.trainer = None;
@@ -126,6 +228,10 @@ impl IncrementalTrainer {
             })
             .collect();
 
+        if candidates.is_empty() {
+            return;
+        }
+
         for (idx, pos_world, color, log_s) in candidates {
             if !grid.is_free(pos_world) {
                 continue;
@@ -138,7 +244,12 @@ impl IncrementalTrainer {
             log_scales.extend_from_slice(&[log_s, log_s, log_s]);
         }
 
-        self.add_by_means(means, sh_coeffs, Some(log_scales))
+        self.add_by_means(
+            means,
+            sh_coeffs,
+            Some(log_scales),
+            self.config.cov_init_opacity,
+        )
     }
 
     fn add_from_strided_depth(&mut self, view: &ViewData, added: &mut [bool]) {
@@ -181,21 +292,25 @@ impl IncrementalTrainer {
         }
 
         if self.config.init_scales_with_knn {
-            self.add_by_means(means, sh_coeffs, None)
+            self.add_by_means(means, sh_coeffs, None, self.config.cov_init_opacity)
         } else {
-            self.add_by_means(means, sh_coeffs, Some(log_scales))
+            self.add_by_means(
+                means,
+                sh_coeffs,
+                Some(log_scales),
+                self.config.cov_init_opacity,
+            )
         }
     }
 
     async fn densify(&mut self, view: &ViewData, added: &mut [bool]) {
-        log::info!("==============================================");
+        let start = Instant::now();
 
         let cfg = self.config.train_config.clone();
         let w = view.image.width() as usize;
         let h = view.image.height() as usize;
         let img_size = view.glam_img_size();
 
-        let start = Instant::now();
         let splats = self.splats.clone().unwrap();
         let ssim = ssim_map(
             splats,
@@ -214,27 +329,21 @@ impl IncrementalTrainer {
             .await
             .unwrap()
             .clamp(-1.0, 1.0);
-        log::info!("Computing SSIM took: {:?}", start.elapsed());
 
         let num_samples =
             (cfg.densify_max_samples as f32 * (1.0 - 0.5 * mean_ssim - 0.5)).round() as usize;
-        log::info!("SSIM={mean_ssim} -> num_samples={num_samples}");
 
         if num_samples == 0 {
-            log::info!("==============================================");
             return;
         }
 
-        let start = Instant::now();
         let ssim_cpu = ssim
             .into_data_async()
             .await
             .unwrap()
             .into_vec::<f32>()
             .unwrap();
-        log::info!("Moving SSIM to CPU took: {:?}", start.elapsed());
 
-        let start = Instant::now();
         let depth = view.depth.as_ref().unwrap();
         // Collect only the candidate pixels (weight > 0) into a compact set, so
         // the sampler never has to scan the many zero-weight (already-added or
@@ -261,9 +370,7 @@ impl IncrementalTrainer {
         if n == 0 {
             return;
         }
-        log::info!("Computing sampling weights took: {:?}", start.elapsed());
 
-        let start = Instant::now();
         // Weighted sampling *with* replacement via an O(1)-per-draw alias table,
         // deduplicated against `added`. Since n << valid, collisions are rare so
         // the retry loop is cheap, and the result matches without-replacement
@@ -280,9 +387,7 @@ impl IncrementalTrainer {
                 sampled.push(idx);
             }
         }
-        log::info!("Sampling took: {:?}", start.elapsed());
 
-        let start = Instant::now();
         let raw_img = view.image.as_rgba8().unwrap().as_raw();
         let mut means = Vec::with_capacity(n * 3);
         let mut sh_coeffs = Vec::with_capacity(n * 3);
@@ -298,9 +403,7 @@ impl IncrementalTrainer {
             means.extend_from_slice(&[pos_world.x, pos_world.y, pos_world.z]);
             sh_coeffs.extend_from_slice(&[color, color, color]);
         }
-        log::info!("Creating points took: {:?}", start.elapsed());
 
-        let start = Instant::now();
         let log_scales = match cfg.densify_scale_mode {
             DensifyScaleMode::Constant => Some(vec![
                 cfg.densify_const_cov_scale.max(1e-6).ln();
@@ -309,13 +412,17 @@ impl IncrementalTrainer {
             DensifyScaleMode::Knn => None,
         };
 
-        self.add_by_means(means, sh_coeffs, log_scales);
+        self.add_by_means(means, sh_coeffs, log_scales, cfg.densify_init_opacity);
         log::info!("Adding to splats took: {:?}", start.elapsed());
-
-        log::info!("==============================================");
     }
 
-    fn add_by_means(&mut self, means: Vec<f32>, sh_coeffs: Vec<f32>, log_scales: Option<Vec<f32>>) {
+    fn add_by_means(
+        &mut self,
+        means: Vec<f32>,
+        sh_coeffs: Vec<f32>,
+        log_scales: Option<Vec<f32>>,
+        init_opacity: f32,
+    ) {
         let sh_degree = self.config.sh_degree;
         let render_mode = self.config.render_mode;
 
@@ -326,10 +433,7 @@ impl IncrementalTrainer {
                 rotations: None,
                 log_scales,
                 sh_coeffs: Some(sh_coeffs),
-                raw_opacities: Some(vec![
-                    inverse_sigmoid(self.config.cov_init_opacity);
-                    n_splats
-                ]),
+                raw_opacities: Some(vec![inverse_sigmoid(init_opacity); n_splats]),
             },
             render_mode,
             &self.device,
@@ -383,24 +487,26 @@ impl IncrementalTrainer {
         grid
     }
 
-    fn single_view_train_config(&self) -> TrainConfig {
+    fn burst_train_config(&self) -> TrainConfig {
         let cfg = &self.config.train_config;
         let mut train = TrainConfig::default();
 
-        train.total_train_iters = cfg.single_view_train_steps;
+        train.total_train_iters = cfg.densify_at;
         train.render_mode = Some(self.config.render_mode);
 
-        train.lr_mean = cfg.lr_mean;
-        train.lr_mean_end = cfg.lr_mean;
-        train.mean_noise_weight = cfg.mean_noise_weight;
-        train.lr_coeffs_dc = cfg.lr_coeffs_dc;
-        train.lr_coeffs_sh_scale = cfg.lr_coeffs_sh_scale;
-        train.lr_opac = cfg.lr_opac;
-        train.lr_scale = cfg.lr_scale;
-        train.lr_rotation = cfg.lr_rotation;
+        train.lr_mean = cfg.single_view_lr_mean;
+        train.lr_mean_end = cfg.single_view_lr_mean_end;
+        train.lr_opac = cfg.single_view_lr_opac;
+        train.lr_opac_end = cfg.single_view_lr_opac_end;
+        train.lr_scale = cfg.single_view_lr_scale;
+        train.lr_scale_end = cfg.single_view_lr_scale_end;
+
         train.ssim_weight = cfg.ssim_weight;
         train.anti_needle_loss_weight = cfg.anti_needle_loss_weight;
         train.depth_loss_weight = cfg.depth_loss_weight;
+
+        train.max_cov_scale = cfg.max_cov_scale;
+        train.max_cov_scale_loss_weight = cfg.max_cov_scale_loss_weight;
 
         train
     }

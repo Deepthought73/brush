@@ -26,16 +26,19 @@ pub struct IncrementalProcessConfig {
     pub seed: u64,
 
     #[arg(long)]
-    pub eval_every_sec: Option<f64>,
-
-    #[arg(long)]
     pub eval_train_views: bool,
 
-    #[arg(long, default_value = "true")]
-    pub export_on_eval: bool,
+    #[arg(long, default_value = "None")]
+    pub export_every_secs: Option<f64>,
 
     #[arg(long, default_value = "./plys")]
-    pub export_path: String,
+    pub export_ply_path: String,
+
+    #[arg(long, default_value = "./meta")]
+    pub export_poses_path: String,
+
+    #[arg(long, default_value = "./meta")]
+    pub export_meta_info_path: String,
 
     #[arg(long, default_value = "1")]
     pub sh_degree: u32,
@@ -73,29 +76,39 @@ pub struct IncrementalProcessConfig {
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct IncrementalTrainConfig {
+    pub initial_pose_opt: bool,
+    pub initial_pose_lr_start: f64,
+    pub initial_pose_lr_end: f64,
+    pub initial_pose_lr_steps: u32,
+
     pub view_sampling_strategy: String,
     pub all_view_train_secs: f64,
 
-    pub densify_every: u32,
+    pub densify_at: u32,
     pub densify_max_samples: usize,
     pub densify_recip_weighting: bool,
     pub densify_ssim_threshold: f32,
     pub densify_scale_mode: DensifyScaleMode,
     pub densify_const_cov_scale: f32,
+    pub densify_init_opacity: f32,
+
     pub single_view_train_steps: u32,
-    pub lr_mean: f64,
-    pub mean_noise_weight: f32,
-    pub lr_coeffs_dc: f64,
-    pub lr_coeffs_sh_scale: f32,
-    pub lr_opac: f64,
-    pub lr_scale: f64,
-    pub lr_rotation: f64,
+    pub single_view_lr_opac: f64,
+    pub single_view_lr_opac_end: f64,
+    pub single_view_lr_mean: f64,
+    pub single_view_lr_mean_end: f64,
+    pub single_view_lr_scale: f64,
+    pub single_view_lr_scale_end: f64,
+
     pub ssim_weight: f32,
     pub anti_needle_loss_weight: f32,
     pub depth_loss_weight: f32,
 
     pub pose_opt: bool,
     pub lr_pose_opt: f64,
+
+    pub max_cov_scale: f32,
+    pub max_cov_scale_loss_weight: f32,
 }
 
 impl Default for IncrementalProcessConfig {

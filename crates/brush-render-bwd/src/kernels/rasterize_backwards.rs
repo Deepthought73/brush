@@ -366,7 +366,7 @@ fn accumulate_grads_for_batch(
                         grad.rgb_b += select(splat.color_b >= 0.0f32, vis * v_o_z, 0.0f32);
 
                         let ra = 1.0f32 / (1.0f32 - alpha_eff);
-                        let mut dot_rgb = ((state_w * clamped_r - state_x) * v_o_x
+                        let dot_rgb = ((state_w * clamped_r - state_x) * v_o_x
                             + (state_w * clamped_g - state_y) * v_o_y
                             + (state_w * clamped_b - state_z) * v_o_z)
                             * ra;
@@ -377,7 +377,6 @@ fn accumulate_grads_for_batch(
                             let v_o_d = v_output[pix_base + 4];
                             let state_d = pix_state[s + 4];
                             grad.depth += vis * v_o_d;
-                            dot_rgb += (state_w * splat.depth - state_d) * v_o_d * ra;
                             pix_state[s + 4] = state_d - vis * splat.depth;
                         }
                         // Chain through the cutoff. Hard step (production):

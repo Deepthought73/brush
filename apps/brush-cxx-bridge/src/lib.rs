@@ -1,9 +1,7 @@
-use crate::ffi::{CameraModelId, EvalResult, StampedPose};
+use crate::ffi::{CameraModelId, EvalResult, StampedPose, UnreconstructedAreaAndSsim};
 use anyhow::{Context, ensure};
 use brush_app::ui::app::App;
-use brush_incremental::IncrementalTrainMessage::{
-    ComputeSSIM, ComputeUnreconstructedArea, Eval, ExternalPoseUpdate, NewView,
-};
+use brush_incremental::IncrementalTrainMessage::*;
 use brush_incremental::config::IncrementalProcessConfig;
 use brush_incremental::{
     IncrementalTrainMessage, IncrementalTrainerCreationContext, ViewData,
@@ -13,9 +11,9 @@ use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
 use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use image::DynamicImage;
+use std::fs;
 use std::fs::File;
 use std::path::PathBuf;
-use std::{fs, mem};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 
@@ -41,6 +39,11 @@ mod ffi {
         ssim: f32,
     }
 
+    struct UnreconstructedAreaAndSsim {
+        unreconstructed_area: f32,
+        ssim: f32,
+    }
+
     extern "Rust" {
         type BrushBridge;
 
@@ -52,16 +55,15 @@ mod ffi {
             img_height: u32,
             mask_path: &str,
             gpu_mutex: Box<GpuMutex>,
+            r_unrectified_rectified: [f32; 4],
         ) -> Result<Box<BrushBridge>>;
 
-        fn compute_unreconstructed_area(&self, translation: [f32; 3], quat: [f32; 4]) -> f32;
-
-        unsafe fn compute_ssim(
+        unsafe fn compute_unreconstructed_area_and_ssim(
             &self,
             translation: [f32; 3],
             quat: [f32; 4],
             image_ptr: *const u16,
-        ) -> f32;
+        ) -> UnreconstructedAreaAndSsim;
 
         fn eval(&self) -> EvalResult;
 
@@ -117,13 +119,14 @@ fn new_brush_bridge(
     img_height: u32,
     mask_path: &str,
     gpu_mutex: Box<GpuMutex>,
+    r_unrectified_rectified: [f32; 4],
 ) -> anyhow::Result<Box<BrushBridge>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to initialize tokio runtime");
     let (message_sender, message_receiver) = mpsc::unbounded_channel::<IncrementalTrainMessage>();
-    let config = get_config(config_path);
+    let config = get_config(config_path)?;
     let mask_raw = load_mask(mask_path, img_width, img_height)?;
     let unit_camera = build_unit_camera(camera_params, camera_model_id, img_width, img_height);
 
@@ -132,6 +135,7 @@ fn new_brush_bridge(
             message_receiver,
             gpu_mutex: gpu_mutex.arc(),
             config,
+            r_unrectified_rectified: glam::Quat::from_array(r_unrectified_rectified),
         }),
         message_sender,
         unit_camera,
@@ -144,32 +148,30 @@ fn new_brush_bridge(
 }
 
 impl BrushBridge {
-    fn compute_unreconstructed_area(&self, translation: [f32; 3], quat: [f32; 4]) -> f32 {
-        let (result_sender, result_receiver) = oneshot::channel();
-        self.message_sender
-            .send(ComputeUnreconstructedArea {
-                camera: self.build_camera(translation, quat),
-                img_resolution: glam::UVec2::new(self.img_width, self.img_height),
-                result_sender,
-            })
-            .unwrap();
-
-        self.runtime.block_on(result_receiver).unwrap()
-    }
-
-    fn compute_ssim(&self, translation: [f32; 3], quat: [f32; 4], image_ptr: *const u16) -> f32 {
+    fn compute_unreconstructed_area_and_ssim(
+        &self,
+        translation: [f32; 3],
+        quat: [f32; 4],
+        image_ptr: *const u16,
+    ) -> UnreconstructedAreaAndSsim {
         let gt_img = unsafe { self.copy_into_rgba_image(image_ptr) };
 
         let (result_sender, result_receiver) = oneshot::channel();
         self.message_sender
-            .send(ComputeSSIM {
+            .send(ComputeUnreconstructedAreaAndSSIM {
                 camera: self.build_camera(translation, quat),
+                img_resolution: glam::UVec2::new(self.img_width, self.img_height),
                 gt_img,
                 result_sender,
             })
             .unwrap();
 
-        self.runtime.block_on(result_receiver).unwrap()
+        let res = self.runtime.block_on(result_receiver).unwrap();
+
+        UnreconstructedAreaAndSsim {
+            unreconstructed_area: res.0,
+            ssim: res.1,
+        }
     }
 
     fn eval(&self) -> EvalResult {
@@ -256,14 +258,13 @@ impl BrushBridge {
             .try_init()?;
 
         self.runtime
-            .block_on(run_incremental_training_headless(self.cc.take().unwrap()))
+            .spawn(run_incremental_training_headless(self.cc.take().unwrap()));
+
+        Ok(())
     }
 
     fn stop(&mut self) {
-        drop(mem::replace(
-            &mut self.message_sender,
-            mpsc::unbounded_channel().0,
-        ));
+        self.message_sender.send(Stop).unwrap();
     }
 
     unsafe fn copy_into_rgba_image(&self, image_ptr: *const u16) -> DynamicImage {
@@ -359,21 +360,19 @@ fn build_unit_camera(
     )
 }
 
-fn get_config(config_path: String) -> IncrementalProcessConfig {
-    if config_path.is_empty() {
+fn get_config(config_path: String) -> anyhow::Result<IncrementalProcessConfig> {
+    Ok(if config_path.is_empty() {
         IncrementalProcessConfig::default()
     } else {
         let config_path = PathBuf::from(config_path);
         if fs::exists(&config_path).unwrap_or(false) {
-            serde_json::from_reader(File::open(&config_path).expect("Error reading config"))
-                .unwrap()
+            serde_json::from_reader(File::open(&config_path).expect("Error reading config"))?
         } else {
             serde_json::to_writer(
-                File::create(&config_path).unwrap(),
+                File::create(&config_path)?,
                 &IncrementalProcessConfig::default(),
-            )
-            .unwrap();
+            )?;
             IncrementalProcessConfig::default()
         }
-    }
+    })
 }

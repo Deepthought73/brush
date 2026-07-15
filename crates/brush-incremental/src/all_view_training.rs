@@ -35,9 +35,11 @@ impl IncrementalTrainer {
             let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats);
             let (new_diff, _stats) = trainer.step(batch, diff_splats).await;
             splats = new_diff.valid();
-        }
 
-        log::info!("Trained on all for: {:?}", start.elapsed());
+            if !self.message_receiver.is_empty() {
+                break;
+            }
+        }
 
         let base: Vec<_> = self.train_views.iter().map(|v| v.camera).collect();
         if let Some(corrected) = trainer.corrected_train_cameras(&base).await {
@@ -90,16 +92,22 @@ impl IncrementalTrainer {
         }
     }
 
-    fn create_all_view_train_config(&self) -> TrainConfig {
+    pub fn create_all_view_train_config(&self) -> TrainConfig {
         let config = &self.config.train_config;
         let mut cfg = TrainConfig::default();
-        cfg.lr_mean = config.lr_mean;
-        cfg.lr_mean_end = config.lr_mean;
+
+        cfg.lr_mean_end = cfg.lr_mean;
         cfg.depth_loss_weight = config.depth_loss_weight;
         cfg.anti_needle_loss_weight = config.anti_needle_loss_weight;
+        cfg.ssim_weight = config.ssim_weight;
+
         cfg.pose_opt = config.pose_opt;
         cfg.lr_pose = config.lr_pose_opt;
         cfg.lr_pose_end = config.lr_pose_opt;
+
+        cfg.max_cov_scale = config.max_cov_scale;
+        cfg.max_cov_scale_loss_weight = config.max_cov_scale_loss_weight;
+
         cfg
     }
 }

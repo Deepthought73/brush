@@ -36,9 +36,16 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Training options", default_value = "0.012")]
     pub lr_opac: f64,
 
+    /// Learning rate for the opacity parameter.
+    #[arg(long, help_heading = "Training options", default_value = "0.012")]
+    pub lr_opac_end: f64,
+
     /// Learning rate for the scale parameters.
     #[arg(long, help_heading = "Training options", default_value = "5e-3")]
     pub lr_scale: f64,
+
+    #[arg(long, help_heading = "Training options", default_value = "5e-3")]
+    pub lr_scale_end: f64,
 
     /// Learning rate for the rotation parameters.
     #[arg(long, help_heading = "Training options", default_value = "2e-3")]
@@ -154,6 +161,12 @@ pub struct TrainConfig {
     /// estimated from the camera spacing (with a 1m minimum).
     #[arg(long, help_heading = "Training options")]
     pub random_init_scene_scale: Option<f32>,
+
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    pub max_cov_scale: f32,
+
+    #[arg(long, help_heading = "Training options", default_value = "0.0")]
+    pub max_cov_scale_loss_weight: f32,
 }
 
 impl Default for TrainConfig {

@@ -95,6 +95,8 @@ impl GpuBatch {
 pub struct SplatTrainer {
     config: TrainConfig,
     sched_mean: ExponentialLrScheduler,
+    sched_opac: ExponentialLrScheduler,
+    sched_scale: ExponentialLrScheduler,
     refine_record: Option<RefineRecord>,
     optim: Option<OptimizerType>,
     ssim_enabled: bool,
@@ -165,6 +167,14 @@ impl SplatTrainer {
             (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_train_iters as f64);
         let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
 
+        let decay =
+            (config.lr_opac_end / config.lr_opac).powf(1.0 / config.total_train_iters as f64);
+        let lr_opac = ExponentialLrSchedulerConfig::new(config.lr_opac, decay);
+
+        let decay =
+            (config.lr_scale_end / config.lr_scale).powf(1.0 / config.total_train_iters as f64);
+        let lr_scale = ExponentialLrSchedulerConfig::new(config.lr_scale, decay);
+
         let ssim_enabled = config.ssim_weight > 0.0;
 
         // Growth is gated on the global iter. LOD phases run past
@@ -179,6 +189,8 @@ impl SplatTrainer {
         Self {
             config,
             sched_mean: lr_mean.init().expect("Mean lr schedule must be valid."),
+            sched_opac: lr_opac.init().expect("Mean lr schedule must be valid."),
+            sched_scale: lr_scale.init().expect("Mean lr schedule must be valid."),
             optim: None,
             refine_record: None,
             ssim_enabled,
@@ -353,29 +365,29 @@ impl SplatTrainer {
             if use_depth && let Some(gt_depth) = &batch.depth {
                 let gt_depth = gt_depth.clone();
                 let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
-                let alpha = pred_image.clone().slice(s![.., .., 3..4]);
+                let alpha = pred_image.clone().slice(s![.., .., 3..4]).detach();
                 let expected_depth =
                     (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]);
                 loss = loss + depth_loss(expected_depth, gt_depth) * self.config.depth_loss_weight;
             }
 
-            // Isotropy regulariser: penalise needle-shaped splats (one axis
-            // much longer than the others) without touching plane-shaped ones.
-            // Per splat we take the ratio of the largest to the median scale;
-            // a plane's two longest axes are ~equal so the ratio is ~1 and the
-            // `- 1` margin (with relu) zeroes both cost and gradient, while a
-            // needle's lone long axis drives the ratio up. Done in log space
-            // where the scale params live: `exp(log_max - log_median)`.
+            // Isotropy regulariser: penalise needle-shaped splats
             if self.config.anti_needle_loss_weight > 0.0 {
                 let log_scales = splats.log_scales(); // [N, 3]
                 let log_max = log_scales.clone().max_dim(1);
                 let log_min = log_scales.clone().min_dim(1);
-                // median = sum - max - min, exact for exactly 3 elements.
-                let log_median = log_scales.sum_dim(1) - log_max.clone() - log_min;
-                let ratio = (log_max - log_median).exp(); // max_scale / median_scale, >= 1
-                loss = loss
-                    + ratio.sub_scalar(1.0).clamp_min(0.0).mean()
-                        * self.config.anti_needle_loss_weight;
+                let ratio = (log_max - log_min).exp();
+                loss = loss + ratio.sub_scalar(1.0).mean() * self.config.anti_needle_loss_weight;
+            }
+
+            // Max-size regulariser: keep splats from growing arbitrarily large.
+            // Only scales above `max_cov_scale` are penalised (relu margin), and
+            // those are pulled back towards the threshold with an L2 cost. Scales
+            // at or below the threshold contribute neither loss nor gradient.
+            if self.config.max_cov_scale_loss_weight > 0.0 {
+                let scales = splats.scales(); // world-space, [N, 3]
+                let excess = scales.sub_scalar(self.config.max_cov_scale).clamp_min(0.0);
+                loss = loss + self.config.max_cov_scale_loss_weight * excess.powi_scalar(2).mean();
             }
 
             // Strip the autodiff graph off the loss so consumers can read the
@@ -434,6 +446,8 @@ impl SplatTrainer {
             });
 
         let lr_mean = self.sched_mean.step() * median_scale as f64;
+        let lr_opac = self.sched_opac.step();
+        let lr_scale = self.sched_scale.step();
 
         // Update per-component LR scaling for the transforms param.
         // transforms layout: means(3) + rotations(4) + log_scales(3)
@@ -449,9 +463,9 @@ impl SplatTrainer {
                 self.config.lr_rotation as f32,
                 self.config.lr_rotation as f32,
                 self.config.lr_rotation as f32,
-                self.config.lr_scale as f32,
-                self.config.lr_scale as f32,
-                self.config.lr_scale as f32,
+                lr_scale as f32,
+                lr_scale as f32,
+                lr_scale as f32,
             ];
             let transform_scaling =
                 Tensor::<1>::from_floats(lr_values.as_slice(), &opt_device).reshape([1, 10]);
@@ -483,7 +497,7 @@ impl SplatTrainer {
             splats = trace_span!("Opacity step").in_scope(|| {
                 let grad_opac =
                     GradientsParams::from_params(&mut grads, &splats, &[splats.raw_opacities.id]);
-                optimizer.step(self.config.lr_opac, splats, grad_opac)
+                optimizer.step(lr_opac, splats, grad_opac)
             });
             splats
         });
@@ -522,7 +536,7 @@ impl SplatTrainer {
         // Add noise to the means portion (cols 0..3), and optionally scales
         // (cols 7..10) and rotations (cols 3..7).
         splats.transforms = splats.transforms.map(|t| {
-            // Only allow noised gaussians to travel at most the entire extent of the current bounds.
+            // Only allow noised gaussians to tlavel at most the entire extent of the current bounds.
             let noise_m = (samples * noise_weight_means).clamp(-median_scale, median_scale);
             let inner = t.inner();
             // slice + slice_assign with a clone of inner avoids holding two
@@ -537,13 +551,105 @@ impl SplatTrainer {
             num_visible,
             lr_mean,
             lr_rotation: self.config.lr_rotation,
-            lr_scale: self.config.lr_scale,
+            lr_scale,
             lr_coeffs: self.config.lr_coeffs_dc,
-            lr_opac: self.config.lr_opac,
+            lr_opac,
             loss: loss_inner,
         };
 
         (splats, stats)
+    }
+
+    /// Optimize *only* the per-view camera pose for `batch`, leaving the splats
+    /// (their parameters, optimizer state, refine stats and noise) untouched.
+    ///
+    /// Runs the same forward render + photometric (and optional depth) loss +
+    /// backward as [`Self::step_prepared`], but the only optimizer stepped is
+    /// the [`PoseOptimizer`]. `splats` must already be lifted to the autodiff
+    /// backend (as for `step_prepared`); they are used only to build the render
+    /// graph so the pose delta receives gradients — no splat param is written.
+    ///
+    /// No-op (returns without touching anything) unless [`Self::enable_pose_opt`]
+    /// has been called.
+    pub async fn step_pose_only(&mut self, batch: &GpuBatch, splats: Splats) {
+        if self.pose_opt.is_none() {
+            return;
+        }
+
+        let (img_h, img_w) = (batch.img_h, batch.img_w);
+        let camera = batch.camera;
+        let img_size = glam::uvec2(img_w as u32, img_h as u32);
+        let base = &self.config.background_color;
+        // Deterministic background (no noise): we're fitting a pose, so a stable
+        // target is preferable to the exploratory bg noise used for splats.
+        let background = glam::Vec3::new(base[0], base[1], base[2]);
+        let gt_packed = batch.gt_packed.clone();
+        let has_alpha = batch.has_alpha;
+        let masked_alpha = batch.alpha_mode == AlphaMode::Masked;
+
+        // Apply the differentiable per-view pose correction to a throwaway copy
+        // of the splats so the pose delta lands on the autodiff graph. Do NOT
+        // detach/require_grad — that would sever the graph back to the pose
+        // leaf. `splats` itself is kept so `bwd_validate` can drive backward.
+        let po = self.pose_opt.as_ref().expect("pose opt is active");
+        let corrected = po.apply(splats.transforms.val(), batch.view_index, camera.position);
+        let mut render_input = splats.clone();
+        render_input.transforms = Param::initialized(ParamId::new(), corrected);
+
+        let use_depth = batch.depth.is_some() && self.config.depth_loss_weight > 0.0;
+        let raster_mode = if use_depth {
+            RasterizationMode::RgbaAndDepth
+        } else {
+            RasterizationMode::Rgba
+        };
+        let diff_out = render_splats_with_pass(
+            render_input,
+            &camera,
+            img_size,
+            background,
+            RasterPass::Backward,
+            raster_mode,
+        )
+        .instrument(trace_span!("Pose forward"))
+        .await;
+
+        let pred_image = diff_out.img;
+
+        // Same RGB loss as `step_prepared`. LPIPS and the anti-needle
+        // regulariser are intentionally omitted: they don't depend on the pose
+        // delta (anti-needle reads `log_scales` only), so they'd contribute no
+        // pose gradient while costing time.
+        let (l1_w, ssim_w) = if self.ssim_enabled {
+            (1.0 - self.config.ssim_weight, -self.config.ssim_weight)
+        } else {
+            (1.0, 0.0)
+        };
+        let composite_bg = (has_alpha && background != glam::Vec3::ZERO).then_some(background);
+        let cfg = ImageLossConfig {
+            l1_weight: l1_w,
+            ssim_weight: ssim_w,
+            composite_bg,
+            mask: masked_alpha,
+        };
+        let pred_for_loss = pred_image.clone().slice(s![.., .., 0..3]);
+        let mut loss = image_loss(pred_for_loss, gt_packed, cfg).mean();
+
+        if use_depth && let Some(gt_depth) = &batch.depth {
+            let accumulated_depth = pred_image.clone().slice(s![.., .., 4..5]);
+            let alpha = pred_image.clone().slice(s![.., .., 3..4]);
+            let expected_depth =
+                (accumulated_depth / alpha.clamp_min(1e-10)).reshape([img_h, img_w]);
+            loss =
+                loss + depth_loss(expected_depth, gt_depth.clone()) * self.config.depth_loss_weight;
+        }
+
+        let mut grads = splats.bwd_validate(loss).await;
+        trace_span!("Pose step").in_scope(|| {
+            self.pose_opt
+                .as_mut()
+                .expect("pose opt is active")
+                .optimize(&mut grads);
+        });
     }
 
     pub async fn refine(&mut self, iter: u32, splats: Splats) -> (Splats, RefineStats) {
