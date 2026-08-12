@@ -30,12 +30,6 @@ impl IncrementalTrainer {
     pub async fn add_host_view(&mut self, view: &mut ViewData) {
         let _guard = self.gpu_mutex.lock_arc();
 
-        if self.config.train_config.initial_pose_opt {
-            let start = Instant::now();
-            self.optimize_view_pose(view).await;
-            log::info!("View pose optimization took {:?}", start.elapsed());
-        }
-
         let w = view.image.width() as usize;
         let h = view.image.height() as usize;
         let mut added_depth_values = vec![false; w * h];
@@ -139,51 +133,6 @@ impl IncrementalTrainer {
         if let Err(e) = save_result {
             log::warn!("Failed to save rendered view {}: {e:?}", view.frame_id);
         }*/
-    }
-
-    async fn optimize_view_pose(&mut self, view: &mut ViewData) {
-        if self.splats.is_none() || !self.config.train_config.initial_pose_opt {
-            return;
-        }
-
-        // This view isn't in `train_views` yet (it's pushed *after*
-        // `add_host_view` returns), so its global `view_index` would be out of
-        // range for a per-training-view pose optimizer. Optimize it in
-        // isolation instead: a single-view pose optimizer at index 0.
-        let mut batch = self.build_scene_batch(view);
-        batch.view_index = 0;
-
-        let mut train_config = TrainConfig::default();
-        train_config.depth_loss_weight = self.config.train_config.depth_loss_weight;
-        train_config.pose_opt = self.config.train_config.initial_pose_opt;
-        train_config.lr_pose = self.config.train_config.initial_pose_lr_start;
-        train_config.lr_pose_end = self.config.train_config.initial_pose_lr_end;
-
-        let mut trainer = SplatTrainer::new(&train_config, &self.device, TRAINER_BOUNDING_BOX);
-        trainer.enable_pose_opt(1, &self.device);
-
-        // Build the GT on the autodiff device so the depth GT shares a backend
-        // with the (autodiff) rendered depth in `step_pose_only`; the packed
-        // RGB GT is force-moved to the inner backend inside `from_scene_batch`.
-        let device = self.splats.as_ref().unwrap().device().autodiff();
-        let gpu_batch = GpuBatch::from_scene_batch(batch, &device);
-
-        for _ in 0..self.config.train_config.initial_pose_lr_steps {
-            let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(
-                self.splats.as_ref().unwrap().clone(),
-            );
-            trainer.step_pose_only(&gpu_batch, diff_splats).await;
-        }
-
-        let base = vec![view.camera];
-        if let Some(corrected) = trainer.corrected_train_cameras(&base).await {
-            let dist = (corrected[0].position - view.camera.position).length();
-            view.camera = corrected[0];
-
-            log::info!("Moved pose by {:?}", dist);
-        }
-
-        self.trainer = None;
     }
 
     async fn add_with_occupancy_grid(&mut self, view: &ViewData, added: &mut [bool]) {

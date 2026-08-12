@@ -9,6 +9,7 @@
     - covisibility query (already in basalt)
 
 - when rectifying image, maybe reduce the image size to reduce the introduced noise (also possible training speedup)
+    - possible training pyramid (like PhotoSLAM)
 
 - normal map loss (I should be able to compute a normal map using the depth map)
 

@@ -76,11 +76,6 @@ pub struct IncrementalProcessConfig {
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct IncrementalTrainConfig {
-    pub initial_pose_opt: bool,
-    pub initial_pose_lr_start: f64,
-    pub initial_pose_lr_end: f64,
-    pub initial_pose_lr_steps: u32,
-
     pub view_sampling_strategy: String,
     pub all_view_train_secs: f64,
 

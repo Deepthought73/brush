@@ -1,4 +1,4 @@
-use crate::ffi::{CameraModelId, EvalResult, StampedPose, UnreconstructedAreaAndSsim};
+use crate::ffi::{EvalResult, StampedPose, UnreconstructedAreaAndSsim};
 use anyhow::{Context, ensure};
 use brush_app::ui::app::App;
 use brush_incremental::IncrementalTrainMessage::*;
@@ -9,7 +9,6 @@ use brush_incremental::{
 };
 use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
-use brush_render::kernels::camera_model::kannala_brandt_4::KannalaBrandt4Params;
 use image::DynamicImage;
 use std::fs;
 use std::fs::File;
@@ -22,12 +21,6 @@ use gpu_mutex::{GpuMutex, GpuMutexGuard, new_gpu_mutex};
 
 #[cxx::bridge(namespace = "brush_cxx_bridge")]
 mod ffi {
-    #[derive(Debug)]
-    enum CameraModelId {
-        Pinhole,
-        KannalaBrandt4,
-    }
-
     struct StampedPose {
         frame_id: i64,
         t: [f32; 3],
@@ -50,7 +43,6 @@ mod ffi {
         fn new_brush_bridge(
             config_path: String,
             camera_params: &[f64],
-            camera_model_id: CameraModelId,
             img_width: u32,
             img_height: u32,
             mask_path: &str,
@@ -114,7 +106,6 @@ struct BrushBridge {
 fn new_brush_bridge(
     config_path: String,
     camera_params: &[f64],
-    camera_model_id: CameraModelId,
     img_width: u32,
     img_height: u32,
     mask_path: &str,
@@ -128,7 +119,7 @@ fn new_brush_bridge(
     let (message_sender, message_receiver) = mpsc::unbounded_channel::<IncrementalTrainMessage>();
     let config = get_config(config_path)?;
     let mask_raw = load_mask(mask_path, img_width, img_height)?;
-    let unit_camera = build_unit_camera(camera_params, camera_model_id, img_width, img_height);
+    let unit_camera = build_unit_camera(camera_params, img_width, img_height);
 
     Ok(BrushBridge {
         cc: Some(IncrementalTrainerCreationContext {
@@ -329,22 +320,8 @@ fn load_mask(mask_path: &str, img_width: u32, img_height: u32) -> anyhow::Result
     Ok(Some(mask_img.to_luma8().into_raw()))
 }
 
-fn build_unit_camera(
-    camera_params: &[f64],
-    camera_model_id: CameraModelId,
-    img_width: u32,
-    img_height: u32,
-) -> Camera {
-    let camera_model = match camera_model_id {
-        CameraModelId::Pinhole => CameraModel::Pinhole,
-        CameraModelId::KannalaBrandt4 => CameraModel::KannalaBrandt4(KannalaBrandt4Params {
-            k1: camera_params[4] as f32,
-            k2: camera_params[5] as f32,
-            k3: camera_params[6] as f32,
-            k4: camera_params[7] as f32,
-        }),
-        _ => panic!("invalid camera model id"),
-    };
+fn build_unit_camera(camera_params: &[f64], img_width: u32, img_height: u32) -> Camera {
+    let camera_model = CameraModel::Pinhole;
     let fx = camera_params[0];
     let fy = camera_params[1];
     let cx = camera_params[2];
