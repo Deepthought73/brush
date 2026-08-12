@@ -21,9 +21,6 @@ impl IncrementalTrainer {
 
                 self.train_views[*idx].camera.position = *position;
                 self.train_views[*idx].camera.rotation = *rotation;
-            } else if let Some(idx) = self.eval_frame_id_to_idx.get(frame_id) {
-                self.eval_views[*idx].camera.position = *position;
-                self.eval_views[*idx].camera.rotation = *rotation;
             }
         }
 

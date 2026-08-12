@@ -21,11 +21,42 @@ set(BRUSH_CXX_BRIDGE_LIB "${CMAKE_CURRENT_BINARY_DIR}/${TARGET_DIR}/libbrush_cxx
 set(BRUSH_CXX_BRIDGE_CXX "${CMAKE_CURRENT_BINARY_DIR}/brush_cxx_bridge.cpp")
 set(BRUSH_CXX_BRIDGE_H   "${CMAKE_CURRENT_BINARY_DIR}/brush_cxx_bridge.h")
 
+# The C++ bridge headers under include/basalt/rt_splatter/ (ImageBridge,
+# RectificationBridge, DepthProviderBridge) pull in basalt's own headers plus
+# OpenCV/TBB/Eigen/Sophus/cereal. Rather than hand-listing each -I as new
+# bridges need new headers, harvest the real include dirs from the targets
+# basalt already links for this code, and hand them to cxx_build as one env
+# var. NOTE: get_target_property only reads a target's *own*
+# INTERFACE_INCLUDE_DIRECTORIES, it does not walk INTERFACE_LINK_LIBRARIES
+# transitively (that resolution only happens internally when CMake generates
+# a real compile command) -- so basalt::basalt-headers's own entry here does
+# NOT pull in the Eigen/Sophus/cereal it links against; those leaf targets
+# must be listed explicitly too.
+set(BRUSH_CXX_BRIDGE_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/include)
+foreach(_target basalt::basalt-headers Eigen3::Eigen Sophus::Sophus cereal::cereal basalt::opencv TBB::tbb)
+    if(TARGET ${_target})
+        get_target_property(_target_includes ${_target} INTERFACE_INCLUDE_DIRECTORIES)
+        if(_target_includes)
+            list(APPEND BRUSH_CXX_BRIDGE_INCLUDE_DIRS ${_target_includes})
+        endif()
+    endif()
+endforeach()
+list(REMOVE_DUPLICATES BRUSH_CXX_BRIDGE_INCLUDE_DIRS)
+# Join with ':' (not CMake's native ';') since that's what build.rs splits on,
+# and a raw ';' would be ambiguous when passed through `cmake -E env`. Entries
+# above are BUILD_INTERFACE/INSTALL_INTERFACE-wrapped generator expressions;
+# they only evaluate at generate time (here, in the COMMAND below), and
+# INSTALL_INTERFACE ones evaluate to empty during a normal build, leaving
+# stray "::" in the joined string -- build.rs skips empty path segments to
+# tolerate that.
+string(REPLACE ";" ":" BASALT_INCLUDE_DIRS_JOINED "${BRUSH_CXX_BRIDGE_INCLUDE_DIRS}")
+
 add_custom_target(brush_cxx_bridge_rust
     BYPRODUCTS ${BRUSH_CXX_BRIDGE_LIB} ${BRUSH_CXX_BRIDGE_CXX} ${BRUSH_CXX_BRIDGE_H}
     COMMAND ${CMAKE_COMMAND} -E env
             CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
             RUSTFLAGS=${RUST_FLAGS}
+            BASALT_INCLUDE_DIRS=${BASALT_INCLUDE_DIRS_JOINED}
             ${CARGO_CMD}
     COMMAND ${CMAKE_COMMAND} -E copy
             ${CMAKE_CURRENT_BINARY_DIR}/cxxbridge/brush-cxx-bridge/src/lib.rs.cc
@@ -42,4 +73,15 @@ set_source_files_properties(${BRUSH_CXX_BRIDGE_CXX} PROPERTIES GENERATED TRUE)
 add_library(brush_cxx_bridge STATIC ${BRUSH_CXX_BRIDGE_CXX})
 add_dependencies(brush_cxx_bridge brush_cxx_bridge_rust)
 target_link_libraries(brush_cxx_bridge PUBLIC pthread dl ${BRUSH_CXX_BRIDGE_LIB})
-target_include_directories(brush_cxx_bridge PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+# PUBLIC: consumers (e.g. basalt_vio, via rt_splatter.h) need rust/cxx.h too --
+# cargo copies it to <CARGO_TARGET_DIR>/cxxbridge/rust/cxx.h, a sibling of the
+# brush_cxx_bridge.h copied into CMAKE_CURRENT_BINARY_DIR itself, not inside it.
+# PRIVATE: only brush_cxx_bridge.cpp itself (the generated glue, which #includes
+# image_bridge.h/rectification_bridge.h/depth_provider_bridge.h directly) needs
+# the harvested basalt/Eigen/Sophus/cereal/OpenCV/TBB dirs -- basalt_vio already
+# gets those independently through its own basalt::opencv/basalt::basalt-headers
+# links, so there's no need to re-expose them here.
+target_include_directories(brush_cxx_bridge
+    PUBLIC ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/cxxbridge
+    PRIVATE ${BRUSH_CXX_BRIDGE_INCLUDE_DIRS}
+)

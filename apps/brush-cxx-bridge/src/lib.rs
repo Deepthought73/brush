@@ -1,4 +1,4 @@
-use crate::ffi::{EvalResult, StampedPose, UnreconstructedAreaAndSsim};
+use crate::ffi::{DepthProviderBridge, EvalResult, ImageBridge, RectificationBridge, StampedPose};
 use anyhow::{Context, ensure};
 use brush_app::ui::app::App;
 use brush_incremental::IncrementalTrainMessage::*;
@@ -9,10 +9,13 @@ use brush_incremental::{
 };
 use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
+use cxx::SharedPtr;
 use image::DynamicImage;
+use parking_lot::Mutex;
 use std::fs;
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 
@@ -32,11 +35,6 @@ mod ffi {
         ssim: f32,
     }
 
-    struct UnreconstructedAreaAndSsim {
-        unreconstructed_area: f32,
-        ssim: f32,
-    }
-
     extern "Rust" {
         type BrushBridge;
 
@@ -48,27 +46,20 @@ mod ffi {
             mask_path: &str,
             gpu_mutex: Box<GpuMutex>,
             r_unrectified_rectified: [f32; 4],
+            rectification: SharedPtr<RectificationBridge>,
+            depth_provider: SharedPtr<DepthProviderBridge>,
         ) -> Result<Box<BrushBridge>>;
 
-        unsafe fn compute_unreconstructed_area_and_ssim(
-            &self,
-            translation: [f32; 3],
-            quat: [f32; 4],
-            image_ptr: *const u16,
-        ) -> UnreconstructedAreaAndSsim;
-
-        fn eval(&self) -> EvalResult;
-
-        unsafe fn add_view_to_splat(
+        fn add_raw_frame(
             &mut self,
             frame_id: i64,
-            image_ptr: *const u16,
-            depth_ptr: *const f32,
+            left: SharedPtr<ImageBridge>,
+            right: SharedPtr<ImageBridge>,
             translation: [f32; 3],
             quat: [f32; 4],
-            is_eval: bool,
-            is_host_frame: bool,
         );
+
+        fn eval(&self) -> EvalResult;
 
         fn update_poses(&mut self, new_poses: Vec<StampedPose>);
 
@@ -87,6 +78,37 @@ mod ffi {
         fn lock(self: &GpuMutex) -> Box<GpuMutexGuard>;
         fn clone(self: &GpuMutex) -> Box<GpuMutex>;
     }
+
+    unsafe extern "C++" {
+        include!("basalt/rt_splatter/image_bridge.h");
+
+        type ImageBridge;
+
+        fn width(self: &ImageBridge) -> u32;
+        fn height(self: &ImageBridge) -> u32;
+        fn data(self: &ImageBridge) -> &[u16];
+    }
+
+    unsafe extern "C++" {
+        include!("basalt/rt_splatter/rectification_bridge.h");
+
+        type RectificationBridge;
+
+        fn rectify_left(self: &RectificationBridge, raw: &ImageBridge) -> SharedPtr<ImageBridge>;
+        fn rectify_right(self: &RectificationBridge, raw: &ImageBridge) -> SharedPtr<ImageBridge>;
+    }
+
+    unsafe extern "C++" {
+        include!("basalt/rt_splatter/depth_provider_bridge.h");
+
+        type DepthProviderBridge;
+
+        fn get_depth(
+            self: &DepthProviderBridge,
+            left_rectified: &ImageBridge,
+            right_rectified: &ImageBridge,
+        ) -> Vec<f32>;
+    }
 }
 
 struct BrushBridge {
@@ -101,6 +123,13 @@ struct BrushBridge {
     mask_raw: Option<Vec<u8>>,
 
     runtime: Runtime,
+
+    gpu_mutex: Arc<Mutex<()>>,
+    rectification: SharedPtr<RectificationBridge>,
+    depth_provider: SharedPtr<DepthProviderBridge>,
+
+    unreconstructed_area_threshold: f32,
+    max_ssim_new_host: f32,
 }
 
 fn new_brush_bridge(
@@ -111,6 +140,8 @@ fn new_brush_bridge(
     mask_path: &str,
     gpu_mutex: Box<GpuMutex>,
     r_unrectified_rectified: [f32; 4],
+    rectification: SharedPtr<RectificationBridge>,
+    depth_provider: SharedPtr<DepthProviderBridge>,
 ) -> anyhow::Result<Box<BrushBridge>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -120,11 +151,14 @@ fn new_brush_bridge(
     let config = get_config(config_path)?;
     let mask_raw = load_mask(mask_path, img_width, img_height)?;
     let unit_camera = build_unit_camera(camera_params, img_width, img_height);
+    let gpu_mutex_arc = gpu_mutex.arc();
+    let unreconstructed_area_threshold = config.train_config.unreconstructed_area_threshold;
+    let max_ssim_new_host = config.train_config.max_ssim_new_anchor;
 
     Ok(BrushBridge {
         cc: Some(IncrementalTrainerCreationContext {
             message_receiver,
-            gpu_mutex: gpu_mutex.arc(),
+            gpu_mutex: gpu_mutex_arc.clone(),
             config,
             r_unrectified_rectified: glam::Quat::from_array(r_unrectified_rectified),
         }),
@@ -134,35 +168,59 @@ fn new_brush_bridge(
         img_height,
         mask_raw,
         runtime,
+        gpu_mutex: gpu_mutex_arc,
+        rectification,
+        depth_provider,
+        unreconstructed_area_threshold,
+        max_ssim_new_host,
     }
     .into())
 }
 
 impl BrushBridge {
-    fn compute_unreconstructed_area_and_ssim(
-        &self,
+    fn add_raw_frame(
+        &mut self,
+        frame_id: i64,
+        left: SharedPtr<ImageBridge>,
+        right: SharedPtr<ImageBridge>,
         translation: [f32; 3],
         quat: [f32; 4],
-        image_ptr: *const u16,
-    ) -> UnreconstructedAreaAndSsim {
-        let gt_img = unsafe { self.copy_into_rgba_image(image_ptr) };
+    ) {
+        let left_rect = self.rectification.rectify_left(&left);
+        let right_rect = self.rectification.rectify_right(&right);
+
+        let gt_img = self.copy_into_rgba_image(&left_rect);
 
         let (result_sender, result_receiver) = oneshot::channel();
         self.message_sender
             .send(ComputeUnreconstructedAreaAndSSIM {
                 camera: self.build_camera(translation, quat),
                 img_resolution: glam::UVec2::new(self.img_width, self.img_height),
-                gt_img,
+                gt_img: gt_img.clone(),
                 result_sender,
             })
             .unwrap();
+        let (unreconstructed_area, ssim) = self.runtime.block_on(result_receiver).unwrap();
 
-        let res = self.runtime.block_on(result_receiver).unwrap();
+        let is_anchor = unreconstructed_area > self.unreconstructed_area_threshold
+            || ssim < self.max_ssim_new_host;
 
-        UnreconstructedAreaAndSsim {
-            unreconstructed_area: res.0,
-            ssim: res.1,
-        }
+        let depth = if is_anchor {
+            let _guard = self.gpu_mutex.lock_arc();
+            Some(self.depth_provider.get_depth(&left_rect, &right_rect))
+        } else {
+            None
+        };
+
+        self.message_sender
+            .send(NewView(ViewData {
+                frame_id,
+                camera: self.build_camera(translation, quat),
+                image: gt_img,
+                depth,
+                is_anchor,
+            }))
+            .unwrap();
     }
 
     fn eval(&self) -> EvalResult {
@@ -170,32 +228,6 @@ impl BrushBridge {
         self.message_sender.send(Eval(tx)).unwrap();
         let (psnr, ssim) = self.runtime.block_on(rx).unwrap();
         EvalResult { psnr, ssim }
-    }
-
-    fn add_view_to_splat(
-        &mut self,
-        frame_id: i64,
-        image_ptr: *const u16,
-        depth_ptr: *const f32,
-        translation: [f32; 3],
-        quat: [f32; 4],
-        is_eval: bool,
-        is_host_frame: bool,
-    ) {
-        let image = unsafe { self.copy_into_rgba_image(image_ptr) };
-        let depth = self.copy_depth(depth_ptr);
-        let camera = self.build_camera(translation, quat);
-
-        self.message_sender
-            .send(NewView(ViewData {
-                frame_id,
-                camera,
-                image,
-                depth,
-                is_eval,
-                is_host_frame,
-            }))
-            .unwrap();
     }
 
     fn update_poses(&mut self, new_poses: Vec<StampedPose>) {
@@ -258,11 +290,11 @@ impl BrushBridge {
         self.message_sender.send(Stop).unwrap();
     }
 
-    unsafe fn copy_into_rgba_image(&self, image_ptr: *const u16) -> DynamicImage {
+    fn copy_into_rgba_image(&self, image: &ImageBridge) -> DynamicImage {
         let pixel_count = (self.img_width * self.img_height) as usize;
         let mut rgba_bytes = Vec::with_capacity(pixel_count * 4);
 
-        let image_slice = unsafe { std::slice::from_raw_parts(image_ptr, pixel_count) };
+        let image_slice = image.data();
         if let Some(mask) = &self.mask_raw {
             for i in 0..pixel_count {
                 let g = (image_slice[i] >> 8) as u8;
@@ -288,17 +320,6 @@ impl BrushBridge {
         camera.position = translation;
         camera.rotation = quat;
         camera
-    }
-
-    fn copy_depth(&self, depth_ptr: *const f32) -> Option<Vec<f32>> {
-        if depth_ptr.is_null() {
-            None
-        } else {
-            // TODO try to pass depth data as shared_ptr to avoid copy
-            let pixel_count = (self.img_width * self.img_height) as usize;
-            let depth_slice = unsafe { std::slice::from_raw_parts(depth_ptr, pixel_count) };
-            Some(depth_slice.to_vec())
-        }
     }
 }
 

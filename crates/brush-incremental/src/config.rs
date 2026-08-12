@@ -25,9 +25,6 @@ pub struct IncrementalProcessConfig {
     #[arg(long, default_value = "42")]
     pub seed: u64,
 
-    #[arg(long)]
-    pub eval_train_views: bool,
-
     #[arg(long, default_value = "None")]
     pub export_every_secs: Option<f64>,
 
@@ -78,6 +75,9 @@ pub struct IncrementalProcessConfig {
 pub struct IncrementalTrainConfig {
     pub view_sampling_strategy: String,
     pub all_view_train_secs: f64,
+
+    pub unreconstructed_area_threshold: f32,
+    pub max_ssim_new_anchor: f32,
 
     pub densify_at: u32,
     pub densify_max_samples: usize,

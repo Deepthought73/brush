@@ -49,6 +49,7 @@ impl IncrementalTrainer {
                     sh_degree: splats.sh_degree(),
                 })
                 .await;
+            self.up_axis = None;
         }
     }
 
@@ -74,11 +75,10 @@ impl IncrementalTrainer {
     pub async fn update_ui_dataset(&self) {
         if let Some(ctx) = &self.ui_ctx {
             let train_views = collect_scene_views(self.train_views.iter());
-            let eval_views = collect_scene_views(self.eval_views.iter());
 
             ctx.emitter
                 .emit(ProcessMessage::TrainMessage(TrainMessage::Dataset {
-                    dataset: Dataset::from_views(train_views, eval_views),
+                    dataset: Dataset::from_views(train_views, vec![]),
                 }))
                 .await;
         }

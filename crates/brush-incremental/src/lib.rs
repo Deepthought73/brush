@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 
-mod add_host_view;
+mod add_anchor_view;
 mod all_view_training;
 pub mod config;
 mod export;
@@ -38,10 +38,17 @@ pub enum IncrementalTrainMessage {
         result_sender: oneshot::Sender<(f32, f32)>,
     },
     NewView(ViewData),
+    NewKeyFrames(Vec<KeyFrame>),
     ExternalPoseUpdate(Vec<(FrameId, glam::Vec3, glam::Quat)>),
-    Train,
     Eval(oneshot::Sender<(f32, f32)>),
     Stop,
+}
+
+pub struct KeyFrame {
+    pub frame_id: FrameId,
+    pub camera: Camera,
+    pub left_rectified: DynamicImage,
+    pub right_rectified: DynamicImage,
 }
 
 pub struct ViewData {
@@ -49,8 +56,7 @@ pub struct ViewData {
     pub camera: Camera,
     pub image: DynamicImage,
     pub depth: Option<Vec<f32>>,
-    pub is_eval: bool,
-    pub is_host_frame: bool,
+    pub is_anchor: bool,
 }
 
 impl ViewData {
@@ -114,9 +120,7 @@ pub struct IncrementalTrainer {
     gpu_mutex: Arc<Mutex<()>>,
 
     train_frame_id_to_idx: HashMap<FrameId, usize>,
-    eval_frame_id_to_idx: HashMap<FrameId, usize>,
     train_views: Vec<ViewData>,
-    eval_views: Vec<ViewData>,
 
     trainer: Option<SplatTrainer>,
     view_sampler: Box<dyn ViewSampler>,
@@ -125,7 +129,7 @@ pub struct IncrementalTrainer {
     training_start: Option<Instant>,
     splats: Option<Splats>,
     config: IncrementalProcessConfig,
-    host_view_count: usize,
+    anchor_count: usize,
     export_count: f64,
     r_unrectified_rectified: glam::Quat,
 
@@ -134,6 +138,7 @@ pub struct IncrementalTrainer {
     device: burn::tensor::Device,
 
     up_axis: Option<glam::Vec3>,
+    up_axis_set: bool,
 
     ui_ctx: Option<UpdateUiContext>,
 }
@@ -157,9 +162,7 @@ impl IncrementalTrainer {
             message_receiver,
             gpu_mutex,
             train_frame_id_to_idx: Default::default(),
-            eval_frame_id_to_idx: Default::default(),
             train_views: Default::default(),
-            eval_views: Default::default(),
             splats: None,
             training_start: None,
             config,
@@ -169,8 +172,9 @@ impl IncrementalTrainer {
             rng,
             trainer: None,
             up_axis: None,
+            up_axis_set: false,
             ui_ctx,
-            host_view_count: 0,
+            anchor_count: 0,
             export_count: 1.0,
             r_unrectified_rectified,
         }
@@ -198,12 +202,20 @@ impl IncrementalTrainer {
                         self.update_up_axis(&view_data.camera);
                         self.add_view(view_data).await;
                     }
+                    NewKeyFrames(_key_frames) => {
+                        /*for kf in key_frames {
+                            let unreconstructed_area = self
+                                .compute_unreconstructed_area(&kf.camera, img_resolution)
+                                .await;
+                            let ssim = self.compute_ssim(&kf.camera, gt_img).await;
+
+                        }*/
+                    }
                     ExternalPoseUpdate(new_poses) => {
                         self.update_poses(new_poses).await;
                     }
-                    Train => self.train().await,
                     Eval(result_sender) => {
-                        let (psnr, ssim) = self.eval(self.config.eval_train_views).await?;
+                        let (psnr, ssim) = self.eval().await?;
                         result_sender.send((psnr, ssim)).unwrap();
                     }
                     Stop => break,
@@ -246,22 +258,16 @@ impl IncrementalTrainer {
     }
 
     async fn add_view(&mut self, mut view_data: ViewData) {
-        if view_data.is_eval {
-            self.eval_frame_id_to_idx
-                .insert(view_data.frame_id, self.eval_views.len());
-            self.eval_views.push(view_data);
-        } else {
-            self.view_sampler.added_new_view(self.train_views.len());
-            self.train_frame_id_to_idx
-                .insert(view_data.frame_id, self.train_views.len());
-            if view_data.is_host_frame {
-                self.host_view_count += 1;
-                let start = Instant::now();
-                self.add_host_view(&mut view_data).await;
-                log::info!("Adding host view took: {:?}", start.elapsed());
-            }
-            self.train_views.push(view_data);
+        self.view_sampler.added_new_view(self.train_views.len());
+        self.train_frame_id_to_idx
+            .insert(view_data.frame_id, self.train_views.len());
+        if view_data.is_anchor {
+            self.anchor_count += 1;
+            let start = Instant::now();
+            self.add_anchor(&mut view_data).await;
+            log::info!("Adding anchor view took: {:?}", start.elapsed());
         }
+        self.train_views.push(view_data);
     }
 
     async fn compute_unreconstructed_area(
@@ -314,16 +320,12 @@ impl IncrementalTrainer {
         .unwrap()
     }
 
-    async fn eval(&mut self, eval_train: bool) -> anyhow::Result<(f32, f32)> {
+    async fn eval(&mut self) -> anyhow::Result<(f32, f32)> {
         if let Some(splats) = self.splats.clone() {
             let mut psnr_sum = 0.;
             let mut ssim_sum = 0.;
 
-            let views = if eval_train {
-                self.train_views.iter()
-            } else {
-                self.eval_views.iter()
-            };
+            let views = self.train_views.iter();
             let num_views = views.len();
 
             if num_views == 0 {
@@ -362,8 +364,9 @@ impl IncrementalTrainer {
     }
 
     fn update_up_axis(&mut self, camera: &Camera) {
-        let rot = glam::Mat3::from_quat(camera.rotation);
-        if self.up_axis.is_none() {
+        if !self.up_axis_set {
+            self.up_axis_set = true;
+            let rot = glam::Mat3::from_quat(camera.rotation);
             self.up_axis = Some(rot.y_axis);
         }
     }

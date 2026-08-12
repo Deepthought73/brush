@@ -27,7 +27,7 @@ const TRAINER_BOUNDING_BOX: BoundingBox = BoundingBox {
 };
 
 impl IncrementalTrainer {
-    pub async fn add_host_view(&mut self, view: &mut ViewData) {
+    pub async fn add_anchor(&mut self, view: &mut ViewData) {
         let _guard = self.gpu_mutex.lock_arc();
 
         let w = view.image.width() as usize;
@@ -97,7 +97,7 @@ impl IncrementalTrainer {
 
         self.trainer = None;
 
-        /* TODO nice for tuning the training params: renders the host view after training on it, maybe make this run optional
+        /* TODO nice for tuning the training params: renders the anchor after training on it, maybe make this run optional
         let (img, _) = render_splats(
             self.splats.clone().unwrap(),
             &view.camera,

@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime};
 struct MetaInfo {
     timestamp_ns: u128,
     train_view_count: usize,
-    host_view_count: usize,
+    anchor_count: usize,
     num_splats: u32,
 }
 
@@ -105,7 +105,7 @@ impl IncrementalTrainer {
         let meta_info = MetaInfo {
             timestamp_ns,
             train_view_count: self.train_views.len(),
-            host_view_count: self.host_view_count,
+            anchor_count: self.anchor_count,
             num_splats,
         };
 
