@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use brush_render::camera::Camera;
 use brush_vfs::DataSource;
 use glam::Vec3;
 
@@ -56,6 +57,10 @@ pub enum ProcessMessage {
         total_frames: u32,
         num_splats: u32,
         sh_degree: u32,
+    },
+    /// Request that the viewer camera jump to this pose.
+    FocusCamera {
+        camera: Camera,
     },
     TrainMessage(TrainMessage),
     /// Some warning occurred during the process, but the process can continue.

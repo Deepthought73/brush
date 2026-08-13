@@ -7,31 +7,43 @@ use brush_process::config::TrainStreamConfig;
 use brush_process::message::{ProcessMessage, TrainMessage};
 use brush_process::slot::SlotSender;
 use brush_render::Splats;
+use brush_render::camera::Camera;
 use brush_vfs::BrushVfs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 pub struct UpdateUiContext {
     pub emitter: TryStreamEmitter<ProcessMessage, anyhow::Error>,
     pub splat_sender: SlotSender<Splats>,
     pub splat_sender_initialized: bool,
+    pub follow_fps: Arc<AtomicU32>,
 }
 
 impl UpdateUiContext {
     pub fn new(
         emitter: TryStreamEmitter<ProcessMessage, anyhow::Error>,
         splat_sender: SlotSender<Splats>,
+        follow_fps: Arc<AtomicU32>,
     ) -> Self {
         Self {
             emitter,
             splat_sender,
             splat_sender_initialized: false,
+            follow_fps,
         }
     }
 }
 
 impl IncrementalTrainer {
+    fn newest_view_camera(&self) -> Option<Camera> {
+        let idx = *self.train_frame_id_to_idx.get(&self.newest_frame_id?)?;
+        self.train_views.get(idx).map(|view| view.camera)
+    }
+
     pub async fn update_splat_in_ui(&mut self) {
+        let focus_camera = self.newest_view_camera();
+
         if let Some(splats) = &self.splats
             && let Some(ctx) = &mut self.ui_ctx
         {
@@ -50,6 +62,14 @@ impl IncrementalTrainer {
                 })
                 .await;
             self.up_axis = None;
+
+            // Follow the reconstruction: jump the viewer camera to the latest view's
+            // pose with every splat update, so the UI tracks the live scan.
+            if let Some(camera) = focus_camera {
+                ctx.emitter
+                    .emit(ProcessMessage::FocusCamera { camera })
+                    .await;
+            }
         }
     }
 

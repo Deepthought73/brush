@@ -5,7 +5,9 @@ use brush_render::{camera::Camera, gaussian_splats::Splats, kernels::camera_mode
 use burn_wgpu::WgpuDevice;
 use egui::{Response, TextureHandle};
 use glam::{Affine3A, Quat, Vec3};
+use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
@@ -20,6 +22,7 @@ struct ProcessHandle {
     messages: mpsc::UnboundedReceiver<anyhow::Result<ProcessMessage>>,
     control: mpsc::UnboundedSender<ControlMessage>,
     splat_view: Slot<Splats>,
+    follow_fps: Option<Arc<AtomicU32>>,
 }
 
 /// A thread-safe wrapper around the UI process.
@@ -133,6 +136,30 @@ impl UiProcess {
         inner.splat_scale = settings.splat_scale;
     }
 
+    /// Rate, in frames per second, at which the connected process pushes UI updates.
+    /// Only meaningful for processes that support tuning it (currently just
+    /// incremental training); returns the default of 5 otherwise.
+    pub fn get_follow_fps(&self) -> f32 {
+        self.read()
+            .process_handle
+            .as_ref()
+            .and_then(|p| p.follow_fps.as_ref())
+            .map_or(5.0, |fps| fps.load(Ordering::Relaxed) as f32)
+    }
+
+    /// Set the connected process's UI push rate; a no-op if the process doesn't
+    /// support this (e.g. regular, non-incremental training).
+    pub fn set_follow_fps(&self, fps: f32) {
+        if let Some(follow_fps) = self
+            .read()
+            .process_handle
+            .as_ref()
+            .and_then(|p| p.follow_fps.as_ref())
+        {
+            follow_fps.store(fps.round().clamp(1.0, 60.0) as u32, Ordering::Relaxed);
+        }
+    }
+
     #[allow(dead_code)] // Used from wasm.rs / android.rs.
     pub fn set_cam_transform(&self, position: Vec3, rotation: Quat) {
         self.write().set_camera_transform(position, rotation);
@@ -174,6 +201,45 @@ impl UiProcess {
         inner.controls.position = translate;
         inner.controls.rotation = rot;
         inner.repaint();
+    }
+
+    /// Blend the camera pose a fraction `alpha` of the way towards `target`'s pose:
+    /// `new = lerp/slerp(old, target, alpha)`. Meant to be called every frame, even
+    /// with an unchanged target, unlike `focus_view` which snaps immediately -
+    /// repeated small blends read as a smooth chase rather than a jump cut. Returns
+    /// whether the pose is still visibly moving, so the caller knows whether to keep
+    /// requesting repaints.
+    pub fn slerp_camera_towards(&self, target: &Camera, alpha: f32) -> bool {
+        const POS_EPS: f32 = 1e-4;
+        const ANGLE_EPS: f32 = 1e-4;
+
+        let mut inner = self.write();
+        inner.camera = *target;
+
+        // Same conversion as `focus_view`: dataset-space pose -> controls space.
+        let new_view_mat = target.world_to_local() * inner.controls.model_local_to_world.inverse();
+        let (_, target_rot, target_pos) = new_view_mat.inverse().to_scale_rotation_translation();
+
+        let cur_pos = inner.controls.position;
+        let cur_rot = inner.controls.rotation;
+        let moving = (target_pos - cur_pos).length() >= POS_EPS
+            || cur_rot.angle_between(target_rot) >= ANGLE_EPS;
+
+        inner.controls.position = if moving {
+            cur_pos.lerp(target_pos, alpha)
+        } else {
+            target_pos
+        };
+        inner.controls.rotation = if moving {
+            cur_rot.slerp(target_rot, alpha)
+        } else {
+            target_rot
+        };
+
+        inner.controls.stop_movement();
+        inner.repaint();
+
+        moving
     }
 
     pub fn set_model_up(&self, up_axis: Vec3) {
@@ -250,6 +316,7 @@ impl UiProcess {
             messages: receiver,
             control: train_sender,
             splat_view: process.splat_view,
+            follow_fps: process.follow_fps,
         });
     }
 

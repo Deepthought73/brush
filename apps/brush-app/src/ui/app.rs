@@ -154,6 +154,9 @@ pub struct CameraSettings {
     pub use_distortion_model: bool,
     pub show_frustums: bool,
     pub frustum_scale: Option<f32>,
+    pub follow_camera_enabled: Option<bool>,
+    pub follow_alpha: Option<f32>,
+    pub follow_camera_offset: Option<f32>,
 }
 
 const TREE_STORAGE_KEY: &str = "brush_tile_tree_v3";

@@ -59,19 +59,32 @@ impl CameraFrustumWidget {
         }
     }
 
-    pub fn set_dataset(&mut self, dataset: &Dataset) {
+   pub fn set_dataset(
+        &mut self,
+        dataset: &Dataset,
+        max_train_views: Option<usize>,
+        focused_camera: Option<Camera>,
+    ) {
         const TRAIN_COLOR: [f32; 4] = [1.0, 0.55, 0.1, 0.95];
         const EVAL_COLOR: [f32; 4] = [0.2, 0.7, 1.0, 0.95];
+        const FOCUSED_COLOR: [f32; 4] = [1.0, 0.15, 0.15, 1.0];
 
         self.instances.clear();
 
-        let train = dataset.train.views.iter().map(|v| (v, TRAIN_COLOR));
+        let train_views = &dataset.train.views;
+        let start = max_train_views.map_or(0, |max| train_views.len().saturating_sub(max));
+        let train = train_views[start..].iter().map(|v| (v, TRAIN_COLOR));
         let eval = dataset
             .eval
             .iter()
             .flat_map(|s| s.views.iter().map(|v| (v, EVAL_COLOR)));
 
         for (view, color) in train.chain(eval) {
+            let color = if focused_camera == Some(view.camera) {
+                FOCUSED_COLOR
+            } else {
+                color
+            };
             let transform = Mat4::from(view.camera.local_to_world()).to_cols_array_2d();
             let tan_half_x = (view.camera.fov_x as f32 * 0.5).tan();
             let tan_half_y = (view.camera.fov_y as f32 * 0.5).tan();

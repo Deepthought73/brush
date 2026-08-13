@@ -14,6 +14,8 @@ use wgpu::{Adapter, Device, Queue};
 
 use std::future::Future;
 use std::pin::{Pin, pin};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use anyhow::Error;
 use async_fn_stream::{TryStreamEmitter, try_fn_stream};
@@ -66,6 +68,7 @@ impl<T> ProcessStream for T where T: Stream<Item = Result<ProcessMessage, Error>
 pub struct RunningProcess {
     pub stream: Pin<Box<dyn ProcessStream>>,
     pub splat_view: Slot<Splats>,
+    pub follow_fps: Option<Arc<AtomicU32>>,
 }
 
 /// Convenience alias for the emitter `try_fn_stream` hands us inside
@@ -111,6 +114,7 @@ pub fn create_process<
     RunningProcess {
         stream: Box::pin(stream),
         splat_view,
+        follow_fps: None,
     }
 }
 

@@ -16,6 +16,7 @@ use rand::rngs::StdRng;
 use rand_distr::num_traits::Zero;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
@@ -76,6 +77,8 @@ pub fn create_incremental_training_process(
     cc: IncrementalTrainerCreationContext,
 ) -> RunningProcess {
     let (splat_sender, splat_view) = slot::channel();
+    let follow_fps = Arc::new(AtomicU32::new(5));
+    let ui_follow_fps = follow_fps.clone();
 
     let stream = try_fn_stream(|emitter| async move {
         let mut trainer = IncrementalTrainer::new(
@@ -83,7 +86,7 @@ pub fn create_incremental_training_process(
             cc.gpu_mutex,
             cc.config,
             cc.r_unrectified_rectified,
-            Some(UpdateUiContext::new(emitter, splat_sender)),
+            Some(UpdateUiContext::new(emitter, splat_sender, ui_follow_fps)),
         )
         .await;
         trainer.init_ui().await;
@@ -93,6 +96,7 @@ pub fn create_incremental_training_process(
     RunningProcess {
         stream: Box::pin(stream),
         splat_view,
+        follow_fps: Some(follow_fps),
     }
 }
 
@@ -141,6 +145,8 @@ pub struct IncrementalTrainer {
     up_axis_set: bool,
 
     ui_ctx: Option<UpdateUiContext>,
+    last_ui_update: Option<Instant>,
+    newest_frame_id: Option<FrameId>,
 }
 
 impl IncrementalTrainer {
@@ -174,6 +180,8 @@ impl IncrementalTrainer {
             up_axis: None,
             up_axis_set: false,
             ui_ctx,
+            last_ui_update: None,
+            newest_frame_id: None,
             anchor_count: 0,
             export_count: 1.0,
             r_unrectified_rectified,
@@ -224,9 +232,20 @@ impl IncrementalTrainer {
                 Err(TryRecvError::Disconnected) => break,
             }
 
-            self.update_splat_in_ui().await;
-            self.update_ui_dataset().await;
-            self.update_train_status_ui().await;
+            let ui_update_interval = self.ui_ctx.as_ref().map_or(Duration::ZERO, |ctx| {
+                Duration::from_millis(
+                    1000 / u64::from(ctx.follow_fps.load(Ordering::Relaxed).max(1)),
+                )
+            });
+            if self
+                .last_ui_update
+                .is_none_or(|last| last.elapsed() >= ui_update_interval)
+            {
+                self.last_ui_update = Some(Instant::now());
+                self.update_splat_in_ui().await;
+                self.update_ui_dataset().await;
+                self.update_train_status_ui().await;
+            }
 
             self.export_all().await?;
 
@@ -258,6 +277,13 @@ impl IncrementalTrainer {
     }
 
     async fn add_view(&mut self, mut view_data: ViewData) {
+        if self
+            .newest_frame_id
+            .is_none_or(|id| view_data.frame_id > id)
+        {
+            self.newest_frame_id = Some(view_data.frame_id);
+        }
+
         self.view_sampler.added_new_view(self.train_views.len());
         self.train_frame_id_to_idx
             .insert(view_data.frame_id, self.train_views.len());

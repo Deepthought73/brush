@@ -1,6 +1,6 @@
 use brush_process::DataSource;
 use brush_process::{create_process, message::ProcessMessage};
-use brush_render::camera::{focal_to_fov, fov_to_focal};
+use brush_render::camera::{Camera, focal_to_fov, fov_to_focal};
 use brush_render::kernels::camera_model::CameraModel;
 use core::f32;
 use eframe::egui_wgpu::RenderState;
@@ -125,6 +125,8 @@ pub struct ScenePanel {
     dataset: Option<brush_dataset::Dataset>,
     #[serde(skip)]
     pose_match_alpha: f32,
+    #[serde(skip)]
+    focused_camera: Option<Camera>,
 }
 
 impl ScenePanel {
@@ -354,6 +356,7 @@ impl ScenePanel {
         self.seen_warning_count = 0;
         self.dataset = None;
         self.pose_match_alpha = 0.0;
+        self.focused_camera = None;
         if let Some(frustums) = self.camera_frustums.as_mut() {
             frustums.clear();
         }
@@ -672,6 +675,63 @@ impl ScenePanel {
 
         if response.changed() {
             settings.frustum_scale = Some(frustum_scale);
+            process.set_cam_settings(&settings);
+        }
+
+        let mut follow_camera_enabled = settings.follow_camera_enabled.unwrap_or(true);
+        if ui
+            .checkbox(&mut follow_camera_enabled, "Follow Camera")
+            .on_hover_text(
+                "When on, the viewer camera chases the incremental trainer's latest \
+                 view. When off, splats still update live but the camera stays put.",
+            )
+            .changed()
+        {
+            settings.follow_camera_enabled = Some(follow_camera_enabled);
+            process.set_cam_settings(&settings);
+        }
+
+        ui.label(RichText::new("Follow Alpha").size(12.0));
+        let mut follow_alpha = settings.follow_alpha.unwrap_or(0.02);
+
+        let response = ui.add(
+            Slider::new(&mut follow_alpha, 0.001..=0.1)
+                .show_value(true)
+                .logarithmic(true)
+                .custom_formatter(|val, _| format!("{val:.2}")),
+        );
+
+        if response.changed() {
+            settings.follow_alpha = Some(follow_alpha);
+            process.set_cam_settings(&settings);
+        }
+
+        ui.label(RichText::new("Follow FPS").size(12.0));
+        let mut follow_fps = process.get_follow_fps();
+
+        let response = ui.add(
+            Slider::new(&mut follow_fps, 1.0..=30.0)
+                .show_value(true)
+                .custom_formatter(|val, _| format!("{val:.0}")),
+        );
+
+        if response.changed() {
+            process.set_follow_fps(follow_fps);
+        }
+
+        ui.label(RichText::new("Follow Camera Offset").size(12.0));
+        let mut follow_camera_offset = settings
+            .follow_camera_offset
+            .unwrap_or(1.5);
+
+        let response = ui.add(
+            Slider::new(&mut follow_camera_offset, 0.0..=2.0)
+                .show_value(true)
+                .custom_formatter(|val, _| format!("{val:.2}")),
+        );
+
+        if response.changed() {
+            settings.follow_camera_offset = Some(follow_camera_offset);
             process.set_cam_settings(&settings);
         }
 
@@ -995,6 +1055,12 @@ impl AppPane for ScenePanel {
                     }
                 }
             }
+            ProcessMessage::FocusCamera { camera } => {
+                // Just record the latest target here; the actual chase happens every
+                // frame in `ui()` so motion stays smooth even between backend updates
+                // (which only arrive when the trainer has new splats to show).
+                self.focused_camera = Some(*camera);
+            }
             ProcessMessage::Warning { error } => {
                 self.warnings.push(ErrorDisplay::new(error));
             }
@@ -1011,7 +1077,8 @@ impl AppPane for ScenePanel {
             }) => {
                 self.dataset = Some(dataset.clone());
                 if let Some(frustums) = self.camera_frustums.as_mut() {
-                    frustums.set_dataset(dataset);
+                    let max_train_views = self.focused_camera.is_some().then_some(10);
+                    frustums.set_dataset(dataset, max_train_views, self.focused_camera);
                 }
             }
             _ => {}
@@ -1109,6 +1176,29 @@ impl AppPane for ScenePanel {
                 self.start_loading(source, process);
             }
         } else {
+            // Chase the incremental trainer's followed camera pose every frame, not just
+            // when a new `FocusCamera` message arrives - the trainer only sends one when
+            // it has new splats to show, but the viewer should keep gliding towards the
+            // last known target in the meantime too. Splats and the frustum overlay keep
+            // updating either way; this only gates moving the viewer camera itself.
+            let cam_settings = process.get_cam_settings();
+            if let Some(raw_target) = self.focused_camera
+                && cam_settings.follow_camera_enabled.unwrap_or(true)
+            {
+                let offset = cam_settings
+                    .follow_camera_offset
+                    .unwrap_or(1.5);
+                let alpha = cam_settings.follow_alpha.unwrap_or(0.02);
+                let mut target = raw_target;
+                // The camera looks down its local +Z axis, so step back along -Z (world
+                // space) to pull the viewer behind it, revealing its frustum gizmo.
+                target.position -= target.rotation * Vec3::Z * offset;
+
+                if process.slerp_camera_towards(&target, alpha) {
+                    ui.ctx().request_repaint();
+                }
+            }
+
             // Animate frame if we have a multi-frame sequence and not paused
             if self.frame_count > 1 && !self.paused {
                 // Advance frame by deltatime (30 fps playback)
