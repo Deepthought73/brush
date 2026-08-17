@@ -1,5 +1,5 @@
 [package]
-name = "brush-cxx-bridge"
+name = "stipple-bridge"
 edition.workspace = true
 version.workspace = true
 readme.workspace = true
@@ -22,7 +22,6 @@ eframe.workspace = true
 anyhow.workspace = true
 log.workspace = true
 glam.workspace = true
-parking_lot.workspace = true
 serde_json.workspace = true
 image.workspace = true
 

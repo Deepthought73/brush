@@ -28,8 +28,6 @@ const TRAINER_BOUNDING_BOX: BoundingBox = BoundingBox {
 
 impl IncrementalTrainer {
     pub async fn add_anchor(&mut self, view: &mut ViewData) {
-        let _guard = self.gpu_mutex.lock_arc();
-
         let w = view.image.width() as usize;
         let h = view.image.height() as usize;
         let mut added_depth_values = vec![false; w * h];

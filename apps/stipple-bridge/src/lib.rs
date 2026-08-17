@@ -1,4 +1,4 @@
-use crate::ffi::{DepthProviderBridge, EvalResult, ImageBridge, RectificationBridge, StampedPose};
+use crate::ffi::{DepthProvider, Rectification, Image, EvalResult, StampedPose};
 use anyhow::{Context, ensure};
 use brush_app::ui::app::App;
 use brush_incremental::IncrementalTrainMessage::*;
@@ -11,18 +11,13 @@ use brush_render::camera::{Camera, focal_to_fov};
 use brush_render::kernels::camera_model::CameraModel;
 use cxx::SharedPtr;
 use image::DynamicImage;
-use parking_lot::Mutex;
 use std::fs;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 
-mod gpu_mutex;
-use gpu_mutex::{GpuMutex, GpuMutexGuard, new_gpu_mutex};
-
-#[cxx::bridge(namespace = "brush_cxx_bridge")]
+#[cxx::bridge(namespace = "stipple_bridge")]
 mod ffi {
     struct StampedPose {
         frame_id: i64,
@@ -36,25 +31,24 @@ mod ffi {
     }
 
     extern "Rust" {
-        type BrushBridge;
+        type StippleBridge;
 
-        fn new_brush_bridge(
+        fn new_stipple_bridge(
             config_path: String,
             camera_params: &[f64],
             img_width: u32,
             img_height: u32,
             mask_path: &str,
-            gpu_mutex: Box<GpuMutex>,
             r_unrectified_rectified: [f32; 4],
-            rectification: SharedPtr<RectificationBridge>,
-            depth_provider: SharedPtr<DepthProviderBridge>,
-        ) -> Result<Box<BrushBridge>>;
+            rectification: SharedPtr<Rectification>,
+            depth_provider: SharedPtr<DepthProvider>,
+        ) -> Result<Box<StippleBridge>>;
 
         fn add_raw_frame(
             &mut self,
             frame_id: i64,
-            left: SharedPtr<ImageBridge>,
-            right: SharedPtr<ImageBridge>,
+            left: SharedPtr<Image>,
+            right: SharedPtr<Image>,
             translation: [f32; 3],
             quat: [f32; 4],
         );
@@ -70,48 +64,39 @@ mod ffi {
         fn stop(&mut self);
     }
 
-    extern "Rust" {
-        type GpuMutex;
-        type GpuMutexGuard;
-
-        fn new_gpu_mutex() -> Box<GpuMutex>;
-        fn lock(self: &GpuMutex) -> Box<GpuMutexGuard>;
-        fn clone(self: &GpuMutex) -> Box<GpuMutex>;
-    }
-
     unsafe extern "C++" {
         include!("basalt/rt_splatter/image_bridge.h");
 
-        type ImageBridge;
+        type Image;
 
-        fn width(self: &ImageBridge) -> u32;
-        fn height(self: &ImageBridge) -> u32;
-        fn data(self: &ImageBridge) -> &[u16];
+        fn width(&self) -> u32;
+        fn height(&self) -> u32;
+        fn data(&self) -> &[u16];
     }
 
     unsafe extern "C++" {
         include!("basalt/rt_splatter/rectification_bridge.h");
 
-        type RectificationBridge;
+        type Rectification;
 
-        fn rectify_left(self: &RectificationBridge, raw: &ImageBridge) -> SharedPtr<ImageBridge>;
-        fn rectify_right(self: &RectificationBridge, raw: &ImageBridge) -> SharedPtr<ImageBridge>;
+        fn rectify_left(&self, raw: &Image) -> SharedPtr<Image>;
+        fn rectify_right(&self, raw: &Image) -> SharedPtr<Image>;
     }
 
     unsafe extern "C++" {
         include!("basalt/rt_splatter/depth_provider_bridge.h");
 
-        type DepthProviderBridge;
+        type DepthProvider;
 
         fn get_depth(
-            self: &DepthProviderBridge,
-            left_rectified: &ImageBridge,
-            right_rectified: &ImageBridge,
+            &self,
+            left_rectified: &Image,
+            right_rectified: &Image,
         ) -> Vec<f32>;
     }
 }
 
-struct BrushBridge {
+struct StippleBridge {
     cc: Option<IncrementalTrainerCreationContext>,
 
     message_sender: mpsc::UnboundedSender<IncrementalTrainMessage>,
@@ -124,25 +109,23 @@ struct BrushBridge {
 
     runtime: Runtime,
 
-    gpu_mutex: Arc<Mutex<()>>,
-    rectification: SharedPtr<RectificationBridge>,
-    depth_provider: SharedPtr<DepthProviderBridge>,
+    rectification: SharedPtr<Rectification>,
+    depth_provider: SharedPtr<DepthProvider>,
 
     unreconstructed_area_threshold: f32,
     max_ssim_new_host: f32,
 }
 
-fn new_brush_bridge(
+fn new_stipple_bridge(
     config_path: String,
     camera_params: &[f64],
     img_width: u32,
     img_height: u32,
     mask_path: &str,
-    gpu_mutex: Box<GpuMutex>,
     r_unrectified_rectified: [f32; 4],
-    rectification: SharedPtr<RectificationBridge>,
-    depth_provider: SharedPtr<DepthProviderBridge>,
-) -> anyhow::Result<Box<BrushBridge>> {
+    rectification: SharedPtr<Rectification>,
+    depth_provider: SharedPtr<DepthProvider>,
+) -> anyhow::Result<Box<StippleBridge>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -151,14 +134,12 @@ fn new_brush_bridge(
     let config = get_config(config_path)?;
     let mask_raw = load_mask(mask_path, img_width, img_height)?;
     let unit_camera = build_unit_camera(camera_params, img_width, img_height);
-    let gpu_mutex_arc = gpu_mutex.arc();
     let unreconstructed_area_threshold = config.train_config.unreconstructed_area_threshold;
     let max_ssim_new_host = config.train_config.max_ssim_new_anchor;
 
-    Ok(BrushBridge {
+    Ok(StippleBridge {
         cc: Some(IncrementalTrainerCreationContext {
             message_receiver,
-            gpu_mutex: gpu_mutex_arc.clone(),
             config,
             r_unrectified_rectified: glam::Quat::from_array(r_unrectified_rectified),
         }),
@@ -168,7 +149,6 @@ fn new_brush_bridge(
         img_height,
         mask_raw,
         runtime,
-        gpu_mutex: gpu_mutex_arc,
         rectification,
         depth_provider,
         unreconstructed_area_threshold,
@@ -177,12 +157,12 @@ fn new_brush_bridge(
     .into())
 }
 
-impl BrushBridge {
+impl StippleBridge {
     fn add_raw_frame(
         &mut self,
         frame_id: i64,
-        left: SharedPtr<ImageBridge>,
-        right: SharedPtr<ImageBridge>,
+        left: SharedPtr<Image>,
+        right: SharedPtr<Image>,
         translation: [f32; 3],
         quat: [f32; 4],
     ) {
@@ -206,7 +186,6 @@ impl BrushBridge {
             || ssim < self.max_ssim_new_host;
 
         let depth = if is_anchor {
-            let _guard = self.gpu_mutex.lock_arc();
             Some(self.depth_provider.get_depth(&left_rect, &right_rect))
         } else {
             None
@@ -290,7 +269,7 @@ impl BrushBridge {
         self.message_sender.send(Stop).unwrap();
     }
 
-    fn copy_into_rgba_image(&self, image: &ImageBridge) -> DynamicImage {
+    fn copy_into_rgba_image(&self, image: &Image) -> DynamicImage {
         let pixel_count = (self.img_width * self.img_height) as usize;
         let mut rgba_bytes = Vec::with_capacity(pixel_count * 4);
 

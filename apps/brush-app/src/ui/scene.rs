@@ -680,7 +680,7 @@ impl ScenePanel {
             process.set_cam_settings(&settings);
         }
 
-        let mut follow_camera_enabled = settings.follow_camera_enabled.unwrap_or(true);
+        let mut follow_camera_enabled = settings.follow_camera_enabled.unwrap_or(false);
         if ui
             .checkbox(&mut follow_camera_enabled, "Follow Camera")
             .on_hover_text(
@@ -1079,8 +1079,7 @@ impl AppPane for ScenePanel {
             }) => {
                 self.dataset = Some(dataset.clone());
                 if let Some(frustums) = self.camera_frustums.as_mut() {
-                    let max_train_views = self.focused_camera.is_some().then_some(10);
-                    frustums.set_dataset(dataset, max_train_views, self.focused_camera);
+                    frustums.set_dataset(dataset, self.focused_camera);
                 }
             }
             _ => {}
@@ -1185,7 +1184,7 @@ impl AppPane for ScenePanel {
             // updating either way; this only gates moving the viewer camera itself.
             let cam_settings = process.get_cam_settings();
             if let Some(raw_target) = self.focused_camera
-                && cam_settings.follow_camera_enabled.unwrap_or(true)
+                && cam_settings.follow_camera_enabled.unwrap_or(false)
             {
                 let offset = cam_settings
                     .follow_camera_offset

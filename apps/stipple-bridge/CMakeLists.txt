@@ -1,8 +1,8 @@
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(CARGO_CMD cargo build -p brush-cxx-bridge --verbose)
+    set(CARGO_CMD cargo build -p stipple-bridge --verbose)
     set(TARGET_DIR "debug")
 else ()
-    set(CARGO_CMD cargo build -p brush-cxx-bridge --release --verbose)
+    set(CARGO_CMD cargo build -p stipple-bridge --release --verbose)
     set(TARGET_DIR "release")
 endif ()
 
@@ -17,9 +17,9 @@ if(ENABLE_LTO)
     set(RUST_FLAGS "-Clinker-plugin-lto -Clinker=${CMAKE_C_COMPILER} -Clink-arg=-fuse-ld=lld")
 endif()
 
-set(BRUSH_CXX_BRIDGE_LIB "${CMAKE_CURRENT_BINARY_DIR}/${TARGET_DIR}/libbrush_cxx_bridge.a")
-set(BRUSH_CXX_BRIDGE_CXX "${CMAKE_CURRENT_BINARY_DIR}/brush_cxx_bridge.cpp")
-set(BRUSH_CXX_BRIDGE_H   "${CMAKE_CURRENT_BINARY_DIR}/brush_cxx_bridge.h")
+set(STIPPLE_BRIDGE_LIB "${CMAKE_CURRENT_BINARY_DIR}/${TARGET_DIR}/libstipple_bridge.a")
+set(STIPPLE_BRIDGE_CXX "${CMAKE_CURRENT_BINARY_DIR}/stipple_bridge.cpp")
+set(STIPPLE_BRIDGE_H   "${CMAKE_CURRENT_BINARY_DIR}/stipple_bridge.h")
 
 # The C++ bridge headers under include/basalt/rt_splatter/ (ImageBridge,
 # RectificationBridge, DepthProviderBridge) pull in basalt's own headers plus
@@ -32,16 +32,16 @@ set(BRUSH_CXX_BRIDGE_H   "${CMAKE_CURRENT_BINARY_DIR}/brush_cxx_bridge.h")
 # a real compile command) -- so basalt::basalt-headers's own entry here does
 # NOT pull in the Eigen/Sophus/cereal it links against; those leaf targets
 # must be listed explicitly too.
-set(BRUSH_CXX_BRIDGE_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/include)
+set(STIPPLE_BRIDGE_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/include)
 foreach(_target basalt::basalt-headers Eigen3::Eigen Sophus::Sophus cereal::cereal basalt::opencv TBB::tbb)
     if(TARGET ${_target})
         get_target_property(_target_includes ${_target} INTERFACE_INCLUDE_DIRECTORIES)
         if(_target_includes)
-            list(APPEND BRUSH_CXX_BRIDGE_INCLUDE_DIRS ${_target_includes})
+            list(APPEND STIPPLE_BRIDGE_INCLUDE_DIRS ${_target_includes})
         endif()
     endif()
 endforeach()
-list(REMOVE_DUPLICATES BRUSH_CXX_BRIDGE_INCLUDE_DIRS)
+list(REMOVE_DUPLICATES STIPPLE_BRIDGE_INCLUDE_DIRS)
 # Join with ':' (not CMake's native ';') since that's what build.rs splits on,
 # and a raw ';' would be ambiguous when passed through `cmake -E env`. Entries
 # above are BUILD_INTERFACE/INSTALL_INTERFACE-wrapped generator expressions;
@@ -49,39 +49,39 @@ list(REMOVE_DUPLICATES BRUSH_CXX_BRIDGE_INCLUDE_DIRS)
 # INSTALL_INTERFACE ones evaluate to empty during a normal build, leaving
 # stray "::" in the joined string -- build.rs skips empty path segments to
 # tolerate that.
-string(REPLACE ";" ":" BASALT_INCLUDE_DIRS_JOINED "${BRUSH_CXX_BRIDGE_INCLUDE_DIRS}")
+string(REPLACE ";" ":" BASALT_INCLUDE_DIRS_JOINED "${STIPPLE_BRIDGE_INCLUDE_DIRS}")
 
-add_custom_target(brush_cxx_bridge_rust
-    BYPRODUCTS ${BRUSH_CXX_BRIDGE_LIB} ${BRUSH_CXX_BRIDGE_CXX} ${BRUSH_CXX_BRIDGE_H}
+add_custom_target(stipple_bridge_rust
+    BYPRODUCTS ${STIPPLE_BRIDGE_LIB} ${STIPPLE_BRIDGE_CXX} ${STIPPLE_BRIDGE_H}
     COMMAND ${CMAKE_COMMAND} -E env
             CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
             RUSTFLAGS=${RUST_FLAGS}
             BASALT_INCLUDE_DIRS=${BASALT_INCLUDE_DIRS_JOINED}
             ${CARGO_CMD}
     COMMAND ${CMAKE_COMMAND} -E copy
-            ${CMAKE_CURRENT_BINARY_DIR}/cxxbridge/brush-cxx-bridge/src/lib.rs.cc
-            ${BRUSH_CXX_BRIDGE_CXX}
+            ${CMAKE_CURRENT_BINARY_DIR}/cxxbridge/stipple-bridge/src/lib.rs.cc
+            ${STIPPLE_BRIDGE_CXX}
     COMMAND ${CMAKE_COMMAND} -E copy
-            ${CMAKE_CURRENT_BINARY_DIR}/cxxbridge/brush-cxx-bridge/src/lib.rs.h
-            ${BRUSH_CXX_BRIDGE_H}
+            ${CMAKE_CURRENT_BINARY_DIR}/cxxbridge/stipple-bridge/src/lib.rs.h
+            ${STIPPLE_BRIDGE_H}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     USES_TERMINAL
     VERBATIM
 )
-set_source_files_properties(${BRUSH_CXX_BRIDGE_CXX} PROPERTIES GENERATED TRUE)
+set_source_files_properties(${STIPPLE_BRIDGE_CXX} PROPERTIES GENERATED TRUE)
 
-add_library(brush_cxx_bridge STATIC ${BRUSH_CXX_BRIDGE_CXX})
-add_dependencies(brush_cxx_bridge brush_cxx_bridge_rust)
-target_link_libraries(brush_cxx_bridge PUBLIC pthread dl ${BRUSH_CXX_BRIDGE_LIB})
+add_library(stipple_bridge STATIC ${STIPPLE_BRIDGE_CXX})
+add_dependencies(stipple_bridge stipple_bridge_rust)
+target_link_libraries(stipple_bridge PUBLIC pthread dl ${STIPPLE_BRIDGE_LIB})
 # PUBLIC: consumers (e.g. basalt_vio, via rt_splatter.h) need rust/cxx.h too --
 # cargo copies it to <CARGO_TARGET_DIR>/cxxbridge/rust/cxx.h, a sibling of the
-# brush_cxx_bridge.h copied into CMAKE_CURRENT_BINARY_DIR itself, not inside it.
-# PRIVATE: only brush_cxx_bridge.cpp itself (the generated glue, which #includes
+# stipple_bridge.h copied into CMAKE_CURRENT_BINARY_DIR itself, not inside it.
+# PRIVATE: only stipple_bridge.cpp itself (the generated glue, which #includes
 # image_bridge.h/rectification_bridge.h/depth_provider_bridge.h directly) needs
 # the harvested basalt/Eigen/Sophus/cereal/OpenCV/TBB dirs -- basalt_vio already
 # gets those independently through its own basalt::opencv/basalt::basalt-headers
 # links, so there's no need to re-expose them here.
-target_include_directories(brush_cxx_bridge
+target_include_directories(stipple_bridge
     PUBLIC ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/cxxbridge
-    PRIVATE ${BRUSH_CXX_BRIDGE_INCLUDE_DIRS}
+    PRIVATE ${STIPPLE_BRIDGE_INCLUDE_DIRS}
 )

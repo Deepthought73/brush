@@ -15,8 +15,6 @@ const TRAINER_BOUNDING_BOX: BoundingBox = BoundingBox {
 
 impl IncrementalTrainer {
     pub async fn train(&mut self) {
-        let _guard = self.gpu_mutex.lock_arc();
-
         let train_duration = Duration::from_secs_f64(self.config.train_config.all_view_train_secs);
         if train_duration.is_zero() {
             return;

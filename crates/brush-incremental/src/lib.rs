@@ -10,7 +10,6 @@ use brush_render::{
 use brush_train::eval::{eval_stats, ssim_map};
 use brush_train::train::SplatTrainer;
 use image::DynamicImage;
-use parking_lot::Mutex;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::num_traits::Zero;
@@ -68,7 +67,6 @@ impl ViewData {
 
 pub struct IncrementalTrainerCreationContext {
     pub message_receiver: mpsc::UnboundedReceiver<IncrementalTrainMessage>,
-    pub gpu_mutex: Arc<Mutex<()>>,
     pub config: IncrementalProcessConfig,
     pub r_unrectified_rectified: glam::Quat,
 }
@@ -83,7 +81,6 @@ pub fn create_incremental_training_process(
     let stream = try_fn_stream(|emitter| async move {
         let mut trainer = IncrementalTrainer::new(
             cc.message_receiver,
-            cc.gpu_mutex,
             cc.config,
             cc.r_unrectified_rectified,
             Some(UpdateUiContext::new(emitter, splat_sender, ui_follow_fps)),
@@ -107,7 +104,6 @@ pub async fn run_incremental_training_headless(
 
     let mut trainer = IncrementalTrainer::new(
         cc.message_receiver,
-        cc.gpu_mutex,
         cc.config,
         cc.r_unrectified_rectified,
         None,
@@ -121,7 +117,6 @@ pub async fn run_incremental_training_headless(
 
 pub struct IncrementalTrainer {
     message_receiver: mpsc::UnboundedReceiver<IncrementalTrainMessage>,
-    gpu_mutex: Arc<Mutex<()>>,
 
     train_frame_id_to_idx: HashMap<FrameId, usize>,
     train_views: Vec<ViewData>,
@@ -152,7 +147,6 @@ pub struct IncrementalTrainer {
 impl IncrementalTrainer {
     async fn new(
         message_receiver: mpsc::UnboundedReceiver<IncrementalTrainMessage>,
-        gpu_mutex: Arc<Mutex<()>>,
         config: IncrementalProcessConfig,
         r_unrectified_rectified: glam::Quat,
         ui_ctx: Option<UpdateUiContext>,
@@ -166,7 +160,6 @@ impl IncrementalTrainer {
 
         Self {
             message_receiver,
-            gpu_mutex,
             train_frame_id_to_idx: Default::default(),
             train_views: Default::default(),
             splats: None,
