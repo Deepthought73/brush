@@ -128,6 +128,8 @@ pub fn sample_to_packed_data(sample: DynamicImage) -> (TensorData, bool) {
     (TensorData::new(packed, [h as usize, w as usize]), has_alpha)
 }
 
+/// Same as [`sample_to_packed_data`], but borrows an already-RGBA8 sample
+/// instead of consuming and converting it.
 pub fn sample_to_packed_data_without_copy(sample: &DynamicImage) -> (TensorData, bool) {
     let _span = tracing::trace_span!("sample_to_packed").entered();
     let (w, h) = (sample.width(), sample.height());

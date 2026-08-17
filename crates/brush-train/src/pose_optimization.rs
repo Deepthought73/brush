@@ -17,34 +17,31 @@
 //! and well-conditioned.
 
 use crate::{
-    adam_scaled::{AdamScaled, AdamScaledConfig},
+    adam_scaled::{AdamScaled, AdamState},
     config::TrainConfig,
     quat_vec::quaternion_vec_multiply,
+    train::step_param,
 };
 use brush_render::camera::Camera;
 use burn::{
-    lr_scheduler::{
-        LrScheduler,
-        exponential::{ExponentialLrScheduler, ExponentialLrSchedulerConfig},
-    },
-    module::{Module, Param, ParamId},
-    optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
+    module::{Param, ParamId},
     tensor::{Device, Gradients, Tensor, s},
 };
 
-/// Per-view learnable SE(3) camera corrections, stored as a single
+/// Owns the pose corrections plus their optimizer and LR schedule.
+///
+/// `deltas` holds the per-view learnable SE(3) corrections as a single
 /// `[num_views, 6]` tensor: columns `0..3` are the SO(3) rotation tangent
 /// (axis-angle) and `3..6` are the translation.
-#[derive(Module, Debug)]
-pub struct PoseParams {
-    deltas: Param<Tensor<2>>,
-}
-
-/// Owns the pose corrections plus their optimizer and LR schedule.
 pub struct PoseOptimizer {
-    params: PoseParams,
-    optim: OptimizerAdaptor<AdamScaled, PoseParams>,
-    sched: ExponentialLrScheduler,
+    deltas: Param<Tensor<2>>,
+    adam: AdamScaled,
+    state: AdamState<2>,
+    /// Per-step multiplier of the exponential pose-LR schedule:
+    /// `lr(n) = lr_pose * decay^(n-1)`.
+    lr_pose_decay: f64,
+    lr_pose: f64,
+    step_count: u32,
 }
 
 /// Numerically-safe axis-angle (`[1, 3]`) → unit quaternion (`[1, 4]`, `wxyz`).
@@ -98,21 +95,18 @@ impl PoseOptimizer {
             device.clone().autodiff()
         };
         let deltas = Tensor::<2>::zeros([num_views, 6], &device);
-        let params = PoseParams {
-            deltas: Param::initialized(ParamId::new(), deltas.require_grad()),
-        };
 
         // Exponential decay from `lr_pose` to `lr_pose_end` over training.
         let iters = config.total_train_iters.max(1) as f64;
-        let decay = (config.lr_pose_end / config.lr_pose).powf(1.0 / iters);
-        let sched = ExponentialLrSchedulerConfig::new(config.lr_pose, decay)
-            .init()
-            .expect("Pose lr schedule must be valid.");
+        let lr_pose_decay = (config.lr_pose_end / config.lr_pose).powf(1.0 / iters);
 
         Self {
-            params,
-            optim: AdamScaledConfig::new().with_epsilon(1e-15).init(),
-            sched,
+            deltas: Param::initialized(ParamId::new(), deltas.require_grad()),
+            adam: AdamScaled::new(1e-15),
+            state: AdamState::new(None, false),
+            lr_pose_decay,
+            lr_pose: config.lr_pose,
+            step_count: 0,
         }
     }
 
@@ -130,7 +124,6 @@ impl PoseOptimizer {
         let n = transforms.dims()[0];
 
         let delta = self
-            .params
             .deltas
             .val()
             .slice(s![view_index..view_index + 1, 0..6]); // [1,6]
@@ -157,11 +150,13 @@ impl PoseOptimizer {
     /// Consume the pose gradients from `grads` and take an optimizer step.
     /// Returns the learning rate used.
     pub fn optimize(&mut self, grads: &mut Gradients) -> f64 {
-        let lr = self.sched.step();
-        let grad = GradientsParams::from_params(grads, &self.params, &[self.params.deltas.id]);
-        // Module clone is cheap (Arc-backed tensor handles); the optimizer
-        // consumes and returns the module like the splat optimizer does.
-        self.params = self.optim.step(lr, self.params.clone(), grad);
+        self.step_count += 1;
+        let lr = self.lr_pose * self.lr_pose_decay.powi(self.step_count as i32 - 1);
+        // `step_param` consumes the param; the clone is cheap (Arc-backed
+        // tensor handle) and keeps the same node, so `grad_remove` still finds
+        // this param's gradient.
+        let deltas = self.deltas.clone();
+        self.deltas = step_param(&self.adam, lr, deltas, &mut self.state, grads);
         lr
     }
 
@@ -176,7 +171,6 @@ impl PoseOptimizer {
     /// motion, i.e. rotation `Rᵀ·R_cam` and position `c − Rᵀ·t`.
     pub async fn corrected_cameras(&self, base: &[Camera]) -> Vec<Camera> {
         let data: Vec<f32> = self
-            .params
             .deltas
             .val()
             .inner()
@@ -257,7 +251,7 @@ mod tests {
         let mut opt = PoseOptimizer::new(1, &cfg, &device);
         // Translation-only delta: (+0.1, +0.2, -0.3) on the last three columns.
         let d = Tensor::<2>::from_floats([[0.0, 0.0, 0.0, 0.1, 0.2, -0.3]], &device);
-        opt.params.deltas = Param::initialized(ParamId::new(), d.require_grad());
+        opt.deltas = Param::initialized(ParamId::new(), d.require_grad());
 
         let transforms = sample_transforms(&device);
         let out = opt.apply(transforms.clone(), 0, glam::vec3(0.0, 0.0, 0.0));
@@ -278,7 +272,7 @@ mod tests {
         let cfg = TrainConfig::default();
         let mut opt = PoseOptimizer::new(1, &cfg, &device);
         let d = Tensor::<2>::zeros([1, 6], &device).require_grad();
-        opt.params.deltas = Param::initialized(ParamId::new(), d);
+        opt.deltas = Param::initialized(ParamId::new(), d);
 
         let transforms = sample_transforms(&device);
         let out = opt.apply(transforms, 0, glam::vec3(0.5, 0.5, 0.5));
@@ -286,7 +280,6 @@ mod tests {
         let loss = out.slice(s![.., 0..3]).sum();
         let grads = loss.backward();
         let g = opt
-            .params
             .deltas
             .grad(&grads)
             .expect("pose delta must receive a gradient");

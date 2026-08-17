@@ -65,7 +65,7 @@ impl IncrementalTrainer {
         let mut gpu_batch: Option<GpuBatch> = None;
 
         for _ in 0..self.config.train_config.densify_at {
-            let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(
+            let diff_splats = brush_render::bwd::burn_glue::lift_splats_to_autodiff(
                 self.splats.as_ref().unwrap().clone(),
             );
             let gt = gpu_batch.get_or_insert_with(|| {
@@ -85,7 +85,7 @@ impl IncrementalTrainer {
             TRAINER_BOUNDING_BOX,
         );
         for _ in 0..self.config.train_config.single_view_train_steps {
-            let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(
+            let diff_splats = brush_render::bwd::burn_glue::lift_splats_to_autodiff(
                 self.splats.as_ref().unwrap().clone(),
             );
             let gt = gpu_batch.get_or_insert_with(|| {

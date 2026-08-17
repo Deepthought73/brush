@@ -32,7 +32,7 @@ impl IncrementalTrainer {
         while start.elapsed() < train_duration {
             let batch = self.get_next_train_batch();
 
-            let diff_splats = brush_render_bwd::burn_glue::lift_splats_to_autodiff(splats);
+            let diff_splats = brush_render::bwd::burn_glue::lift_splats_to_autodiff(splats);
             let (new_diff, _stats) = trainer.step(batch, diff_splats).await;
             splats = new_diff.valid();
 

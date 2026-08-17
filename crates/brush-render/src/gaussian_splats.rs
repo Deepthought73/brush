@@ -457,6 +457,7 @@ async fn render_splats_inner(
     };
 
     let use_float = matches!(texture_mode, TextureMode::Float);
+    let render_device = transforms.device();
 
     // Float mode needs `Backward` (f32 image + per-splat bookkeeping); Packed
     // mode goes through the packed u8 path. Neither inference path uses the
@@ -475,6 +476,9 @@ async fn render_splats_inner(
         transforms.into_dispatch(),
         sh_coeffs.into_dispatch(),
         raw_opacities.into_dispatch(),
+        // Inference path: no gradients, so the refine-weight accumulator is a
+        // throwaway scalar the concrete backends ignore.
+        Tensor::<1>::zeros([1], &render_device).into_dispatch(),
         render_mode,
         raster_mode,
         background,
