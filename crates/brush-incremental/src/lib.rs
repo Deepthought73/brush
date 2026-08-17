@@ -77,7 +77,7 @@ pub fn create_incremental_training_process(
     cc: IncrementalTrainerCreationContext,
 ) -> RunningProcess {
     let (splat_sender, splat_view) = slot::channel();
-    let follow_fps = Arc::new(AtomicU32::new(5));
+    let follow_fps = Arc::new(AtomicU32::new(10));
     let ui_follow_fps = follow_fps.clone();
 
     let stream = try_fn_stream(|emitter| async move {

@@ -152,7 +152,7 @@ pub struct CameraSettings {
     pub depth_view: bool,
     pub clamping: CameraClamping,
     pub use_distortion_model: bool,
-    pub show_frustums: bool,
+    pub show_frustums: Option<bool>,
     pub frustum_scale: Option<f32>,
     pub follow_camera_enabled: Option<bool>,
     pub follow_alpha: Option<f32>,

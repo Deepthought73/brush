@@ -144,7 +144,7 @@ impl UiProcess {
             .process_handle
             .as_ref()
             .and_then(|p| p.follow_fps.as_ref())
-            .map_or(5.0, |fps| fps.load(Ordering::Relaxed) as f32)
+            .map_or(10.0, |fps| fps.load(Ordering::Relaxed) as f32)
     }
 
     /// Set the connected process's UI push rate; a no-op if the process doesn't

@@ -657,10 +657,12 @@ impl ScenePanel {
             process.set_cam_settings(&settings);
         }
 
+        let mut show_frustums = settings.show_frustums.unwrap_or(true);
         if ui
-            .checkbox(&mut settings.show_frustums, "Show Camera Frustums")
+            .checkbox(&mut show_frustums, "Show Camera Frustums")
             .changed()
         {
+            settings.show_frustums = Some(show_frustums);
             process.set_cam_settings(&settings);
         }
 
@@ -692,7 +694,7 @@ impl ScenePanel {
         }
 
         ui.label(RichText::new("Follow Alpha").size(12.0));
-        let mut follow_alpha = settings.follow_alpha.unwrap_or(0.02);
+        let mut follow_alpha = settings.follow_alpha.unwrap_or(0.003);
 
         let response = ui.add(
             Slider::new(&mut follow_alpha, 0.001..=0.1)
@@ -1188,7 +1190,7 @@ impl AppPane for ScenePanel {
                 let offset = cam_settings
                     .follow_camera_offset
                     .unwrap_or(1.5);
-                let alpha = cam_settings.follow_alpha.unwrap_or(0.02);
+                let alpha = cam_settings.follow_alpha.unwrap_or(0.003);
                 let mut target = raw_target;
                 // The camera looks down its local +Z axis, so step back along -Z (world
                 // space) to pull the viewer behind it, revealing its frustum gizmo.
@@ -1294,7 +1296,7 @@ impl AppPane for ScenePanel {
                     grid.paint(rect, camera, model_ltw, grid_opacity, ui);
                 }
 
-                if settings.show_frustums
+                if settings.show_frustums.unwrap_or(true)
                     && let Some(frustums) = &self.camera_frustums
                 {
                     frustums.paint(rect, camera, ui, settings.frustum_scale.unwrap_or(0.15));
