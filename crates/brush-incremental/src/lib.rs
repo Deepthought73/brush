@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
+use tracing::{Instrument, trace_span};
 
 mod add_anchor_view;
 mod all_view_training;
@@ -195,8 +196,12 @@ impl IncrementalTrainer {
                     } => {
                         let unreconstructed_area = self
                             .compute_unreconstructed_area(&camera, img_resolution)
+                            .instrument(trace_span!("compute_unreconstructed_area"))
                             .await;
-                        let ssim = self.compute_ssim(&camera, gt_img).await;
+                        let ssim = self
+                            .compute_ssim(&camera, gt_img)
+                            .instrument(trace_span!("compute_ssim"))
+                            .await;
                         result_sender.send((unreconstructed_area, ssim)).unwrap();
                     }
                     NewView(view_data) => {
@@ -213,7 +218,9 @@ impl IncrementalTrainer {
                         }*/
                     }
                     ExternalPoseUpdate(new_poses) => {
-                        self.update_poses(new_poses).await;
+                        self.update_poses(new_poses)
+                            .instrument(trace_span!("update_poses"))
+                            .await;
                     }
                     Eval(result_sender) => {
                         let (psnr, ssim) = self.eval().await?;
@@ -282,9 +289,9 @@ impl IncrementalTrainer {
             .insert(view_data.frame_id, self.train_views.len());
         if view_data.is_anchor {
             self.anchor_count += 1;
-            let start = Instant::now();
-            self.add_anchor(&mut view_data).await;
-            log::info!("Adding anchor view took: {:?}", start.elapsed());
+            self.add_anchor(&mut view_data)
+                .instrument(trace_span!("add_anchor"))
+                .await;
         }
         self.train_views.push(view_data);
     }

@@ -58,7 +58,10 @@ rand = "0.10.0"
 rand_distr = "0.6.0"
 tracing = "0.1.41"
 tracing-tracy = "0.11.3"
-tracing-subscriber = "0.3.19"
+# `env-filter` is not a default feature, and brush uses `EnvFilter` directly.
+# Ask for it explicitly instead of relying on another crate in the graph
+# happening to enable it.
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 winapi = { version = "0.3", features = ["wincon"] }
 

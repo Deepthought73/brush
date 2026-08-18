@@ -1,4 +1,7 @@
-use crate::ffi::{DepthProvider, Rectification, Image, EvalResult, StampedPose};
+#[cfg(feature = "tracy")]
+mod async_zones;
+
+use crate::ffi::{DepthProvider, EvalResult, Image, StampedPose};
 use anyhow::{Context, ensure};
 use brush_app::ui::app::App;
 use brush_incremental::IncrementalTrainMessage::*;
@@ -16,6 +19,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
+use tracing::trace_span;
 
 #[cxx::bridge(namespace = "stipple_bridge")]
 mod ffi {
@@ -40,7 +44,6 @@ mod ffi {
             img_height: u32,
             mask_path: &str,
             r_unrectified_rectified: [f32; 4],
-            rectification: SharedPtr<Rectification>,
             depth_provider: SharedPtr<DepthProvider>,
         ) -> Result<Box<StippleBridge>>;
 
@@ -75,24 +78,11 @@ mod ffi {
     }
 
     unsafe extern "C++" {
-        include!("basalt/rt_splatter/rectification_bridge.h");
-
-        type Rectification;
-
-        fn rectify_left(&self, raw: &Image) -> SharedPtr<Image>;
-        fn rectify_right(&self, raw: &Image) -> SharedPtr<Image>;
-    }
-
-    unsafe extern "C++" {
         include!("basalt/rt_splatter/depth_provider_bridge.h");
 
         type DepthProvider;
 
-        fn get_depth(
-            &self,
-            left_rectified: &Image,
-            right_rectified: &Image,
-        ) -> Vec<f32>;
+        fn get_depth(&self, left_rectified: &Image, right_rectified: &Image) -> Vec<f32>;
     }
 }
 
@@ -109,7 +99,6 @@ struct StippleBridge {
 
     runtime: Runtime,
 
-    rectification: SharedPtr<Rectification>,
     depth_provider: SharedPtr<DepthProvider>,
 
     unreconstructed_area_threshold: f32,
@@ -123,9 +112,61 @@ fn new_stipple_bridge(
     img_height: u32,
     mask_path: &str,
     r_unrectified_rectified: [f32; 4],
-    rectification: SharedPtr<Rectification>,
     depth_provider: SharedPtr<DepthProvider>,
 ) -> anyhow::Result<Box<StippleBridge>> {
+    #[cfg(feature = "tracy")]
+    {
+        struct BrushTracyConfig(tracing_tracy::DefaultConfig);
+
+        impl tracing_tracy::Config for BrushTracyConfig {
+            type Formatter = <tracing_tracy::DefaultConfig as tracing_tracy::Config>::Formatter;
+
+            fn formatter(&self) -> &Self::Formatter {
+                self.0.formatter()
+            }
+
+            fn format_fields_in_zone_name(&self) -> bool {
+                false
+            }
+        }
+
+        use std::sync::Once;
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::fmt::format::FmtSpan;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let timings = std::env::var("BRUSH_SPAN_TIMINGS").unwrap_or_else(|_| {
+                "brush_incremental=trace,stipple_bridge=trace".to_owned()
+            });
+
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry()
+                    // Everything else: ordinary per-poll Tracy zones. The
+                    // `timings` targets are excluded here so their spans are
+                    // not also reported per-poll, which would leave two
+                    // disagreeing zones per call in the statistics view.
+                    .with(
+                        tracing_tracy::TracyLayer::new(BrushTracyConfig(Default::default()))
+                            .with_filter(EnvFilter::new(format!(
+                                "trace,cubecl_runtime=off,cubecl_wgpu=off,{}",
+                                targets_off(&timings)
+                            ))),
+                    )
+                    // The async spans: one zone per call, spanning awaits.
+                    .with(crate::async_zones::AsyncZoneLayer.with_filter(EnvFilter::new(&timings)))
+                    // Same spans as text, with the busy/idle split.
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_span_events(FmtSpan::CLOSE)
+                            .with_level(false)
+                            .with_filter(EnvFilter::new(&timings)),
+                    ),
+            );
+        });
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -149,7 +190,6 @@ fn new_stipple_bridge(
         img_height,
         mask_raw,
         runtime,
-        rectification,
         depth_provider,
         unreconstructed_area_threshold,
         max_ssim_new_host,
@@ -161,15 +201,12 @@ impl StippleBridge {
     fn add_raw_frame(
         &mut self,
         frame_id: i64,
-        left: SharedPtr<Image>,
-        right: SharedPtr<Image>,
+        left_rectified: SharedPtr<Image>,
+        right_rectified: SharedPtr<Image>,
         translation: [f32; 3],
         quat: [f32; 4],
     ) {
-        let left_rect = self.rectification.rectify_left(&left);
-        let right_rect = self.rectification.rectify_right(&right);
-
-        let gt_img = self.copy_into_rgba_image(&left_rect);
+        let gt_img = self.copy_into_rgba_image(&left_rectified);
 
         let (result_sender, result_receiver) = oneshot::channel();
         self.message_sender
@@ -186,7 +223,11 @@ impl StippleBridge {
             || ssim < self.max_ssim_new_host;
 
         let depth = if is_anchor {
-            Some(self.depth_provider.get_depth(&left_rect, &right_rect))
+            let _span = trace_span!("compute depth").entered();
+            Some(
+                self.depth_provider
+                    .get_depth(&left_rectified, &right_rectified),
+            )
         } else {
             None
         };
@@ -352,4 +393,18 @@ fn get_config(config_path: String) -> anyhow::Result<IncrementalProcessConfig> {
             IncrementalProcessConfig::default()
         }
     })
+}
+
+/// Rewrite an `EnvFilter` target list (`a=trace,b=trace`) into the same targets
+/// turned off, so one layer can take exactly what another one drops.
+#[cfg(feature = "tracy")]
+fn targets_off(targets: &str) -> String {
+    targets
+        .split(',')
+        .filter_map(|d| d.split('=').next())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("{t}=off"))
+        .collect::<Vec<_>>()
+        .join(",")
 }

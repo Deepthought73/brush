@@ -2,12 +2,9 @@ use crate::{FrameId, IncrementalTrainer};
 use burn::Tensor;
 use burn::backend::TensorData;
 use burn::module::Param;
-use std::time::Instant;
 
 impl IncrementalTrainer {
     pub async fn update_poses(&mut self, new_updates: Vec<(FrameId, glam::Vec3, glam::Quat)>) {
-        let start = Instant::now();
-
         let mut updates = vec![];
         for (frame_id, position, rotation) in new_updates.iter() {
             if let Some(idx) = self.train_frame_id_to_idx.get(frame_id) {
@@ -70,7 +67,5 @@ impl IncrementalTrainer {
 
         let transforms = Tensor::from_data(TensorData::new(data, dims), &device);
         splats.transforms = Param::initialized(id, transforms.detach().require_grad());
-
-        log::info!("Updating poses took {:?}", start.elapsed());
     }
 }

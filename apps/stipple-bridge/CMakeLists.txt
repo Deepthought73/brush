@@ -1,9 +1,15 @@
+option(STIPPLE_BRIDGE_TRACY "Build stipple-bridge with Tracy profiling" OFF)
+
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CARGO_CMD cargo build -p stipple-bridge --verbose)
     set(TARGET_DIR "debug")
 else ()
     set(CARGO_CMD cargo build -p stipple-bridge --release --verbose)
     set(TARGET_DIR "release")
+endif ()
+
+if (STIPPLE_BRIDGE_TRACY)
+    list(APPEND CARGO_CMD --features tracy)
 endif ()
 
 # If the user is cross compiling to a different target, update the location of the target directory

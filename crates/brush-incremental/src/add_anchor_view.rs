@@ -20,6 +20,7 @@ use rand::rngs::SmallRng;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::{Instrument, trace_span};
 
 const TRAINER_BOUNDING_BOX: BoundingBox = BoundingBox {
     center: glam::Vec3::ZERO,
@@ -34,17 +35,23 @@ impl IncrementalTrainer {
 
         let splats_before = self.splats.as_ref().map(|it| it.num_splats()).unwrap_or(0) as usize;
 
-        match self.config.landmark_add_mode {
-            GaussianAddingMode::OccupancyGrid => {
-                self.add_with_occupancy_grid(view, &mut added_depth_values)
-                    .await
-            }
-            GaussianAddingMode::StridedDepth => {
-                self.add_from_strided_depth(view, &mut added_depth_values)
-            }
-        };
+        async {
+            match self.config.landmark_add_mode {
+                GaussianAddingMode::OccupancyGrid => {
+                    self.add_with_occupancy_grid(view, &mut added_depth_values)
+                        .await
+                }
+                GaussianAddingMode::StridedDepth => {
+                    self.add_from_strided_depth(view, &mut added_depth_values)
+                }
+            };
+        }
+        .instrument(trace_span!("add landmarks"))
+        .await;
 
-        self.train_view(view, &mut added_depth_values).await;
+        self.train_view(view, &mut added_depth_values)
+            .instrument(trace_span!("anchor view training"))
+            .await;
 
         let splats_after = self.splats.as_ref().unwrap().num_splats() as usize;
 
