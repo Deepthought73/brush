@@ -4,6 +4,10 @@
     3. do densification after loss stabilised
     4. this will probably require a smarter view sampling strategy for training on the views
 
+- train with alpha masks
+
+- rgb image training
+
 - decide which keyframes to use
     - possible profit from loop closure keyframe culling by loop closure
     - covisibility query (already in basalt)

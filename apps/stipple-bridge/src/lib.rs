@@ -137,9 +137,8 @@ fn new_stipple_bridge(
 
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            let timings = std::env::var("BRUSH_SPAN_TIMINGS").unwrap_or_else(|_| {
-                "brush_incremental=trace,stipple_bridge=trace".to_owned()
-            });
+            let timings = std::env::var("BRUSH_SPAN_TIMINGS")
+                .unwrap_or_else(|_| "brush_incremental=trace,stipple_bridge=trace".to_owned());
 
             let _ = tracing::subscriber::set_global_default(
                 tracing_subscriber::registry()
@@ -276,7 +275,8 @@ impl StippleBridge {
             let max = logger.filter();
             brush_app::ui::log_panel::install_global_logger(Box::new(logger), max);
 
-            let native_options = eframe::NativeOptions {
+            #[allow(unused_mut)]
+            let mut native_options = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
                     .with_inner_size(egui::Vec2::new(1450.0, 1200.0))
                     .with_active(true),
@@ -284,6 +284,14 @@ impl StippleBridge {
                 persist_window: true,
                 ..Default::default()
             };
+
+            #[cfg(target_os = "linux")]
+            {
+                use winit::platform::x11::EventLoopBuilderExtX11 as _;
+                native_options.event_loop_builder = Some(Box::new(|builder| {
+                    builder.with_any_thread(true);
+                }));
+            }
 
             eframe::run_native(
                 "Incremental Brush",

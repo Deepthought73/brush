@@ -9711,6 +9711,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-tracy",
+ "winit",
 ]
 
 [[package]]
